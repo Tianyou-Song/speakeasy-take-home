@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { topNBy } from "./aggregate";
 import { fuzzyMatch } from "./match";
 import { nextTokenId, parseDraft } from "./parse";
 import { compilePatternRegex, filterRows, uniqueValuesForFacet } from "./filter";
 import {
+  aggregationSummary,
+  canonicalQueryKey,
   isPatternFacet,
   isPatternValue,
   serialiseTokens,
+  type Aggregation,
   type Draft,
   type FacetConfig,
   type MatchedSuggestion,
   type Token,
+  type TopNRow,
 } from "./types";
 
 export type Suggestion =
@@ -43,6 +48,7 @@ export type Suggestion =
       tokens: Token[];
       label: string;
       savedAt: number;
+      nlText?: string;
     }
   | {
       kind: "saved";
@@ -50,6 +56,9 @@ export type Suggestion =
       viewId: string;
       name: string;
       tokens: Token[];
+      // Full state to restore when this suggestion is committed.
+      aggregation: Aggregation | null;
+      nlText?: string;
       label: string;
     };
 
@@ -71,6 +80,15 @@ export interface UseFacetSearchArgs<T> {
 export interface RecentEntry {
   tokens: Token[];
   savedAt: number;
+  // Original natural-language query when the entry came from NL search,
+  // so the recents row can render the sentence rather than serialised tokens.
+  nlText?: string;
+}
+
+export interface ApplyNLArgs {
+  tokens: Token[];
+  aggregation: Aggregation | null;
+  nlText?: string;
 }
 
 export interface UseFacetSearchResult<T> {
@@ -85,15 +103,23 @@ export interface UseFacetSearchResult<T> {
   commitAt: (index: number) => void;
   commit: (s: Suggestion) => void;
   removeToken: (id: string) => void;
+  removeTokensByIds: (ids: string[]) => void;
+  applyTokens: (tokens: Token[], nlText?: string) => void;
+  applyNLResult: (args: ApplyNLArgs) => void;
+  aggregation: Aggregation | null;
+  setAggregation: (a: Aggregation | null) => void;
+  topN: TopNRow[] | null;
   editLastToken: () => void;
   editToken: (id: string) => void;
   clearAll: () => void;
   saveCurrentAsRecent: () => void;
   recents: RecentEntry[];
+  matchedSavedView: SavedView | null;
 }
 
 const RECENTS_LIMIT = 6;
-const DEFAULT_STORAGE_KEY = "facet-search:recents:v1";
+// v3: RecentEntry gained optional `nlText`. v1/v2 still loadable.
+const DEFAULT_STORAGE_KEY = "facet-search:recents:v3";
 
 const byMatchScoreDesc = (a: Suggestion, b: Suggestion): number => {
   const sa = "match" in a && a.match ? a.match.score : 0;
@@ -109,6 +135,7 @@ export function useFacetSearch<T>({
 }: UseFacetSearchArgs<T>): UseFacetSearchResult<T> {
   const [tokens, setTokens] = useState<Token[]>([]);
   const [inputValue, setInputValueRaw] = useState("");
+  const [aggregation, setAggregationRaw] = useState<Aggregation | null>(null);
   const [recents, setRecents] = useState<RecentEntry[]>(() => loadRecents(storageKey));
 
   useEffect(() => {
@@ -126,6 +153,13 @@ export function useFacetSearch<T>({
     () => filterRows(rows, tokens, facetByKey),
     [rows, tokens, facetByKey],
   );
+
+  const topN = useMemo<TopNRow[] | null>(() => {
+    if (!aggregation) return null;
+    const facet = facetByKey.get(aggregation.groupBy);
+    if (!facet) return null;
+    return topNBy(filteredRows, facet, aggregation);
+  }, [aggregation, facetByKey, filteredRows]);
 
   // Pre-aggregate distinct values once per (rows, facets) pair so per-keystroke
   // dropdown rebuilds in value mode are O(uniques), not O(rows).
@@ -169,7 +203,9 @@ export function useFacetSearch<T>({
             viewId: view.id,
             name: view.name,
             tokens: view.tokens,
-            label: serialiseTokens(view.tokens),
+            aggregation: view.aggregation ?? null,
+            ...(view.nlText ? { nlText: view.nlText } : {}),
+            label: savedViewLabel(view, facetByKey),
           })),
         });
       }
@@ -184,6 +220,7 @@ export function useFacetSearch<T>({
             tokens: entry.tokens,
             label: serialiseTokens(entry.tokens),
             savedAt: entry.savedAt,
+            ...(entry.nlText ? { nlText: entry.nlText } : {}),
           })),
         });
       }
@@ -243,7 +280,20 @@ export function useFacetSearch<T>({
     }
 
     return out;
-  }, [draft, facets, recents, facetByKey, uniquesByFacet]);
+  }, [draft, facets, recents, facetByKey, uniquesByFacet, savedViews]);
+
+  // Identifies whether the current full query state (tokens + aggregation)
+  // exactly matches a saved view (order-independent). The single source of
+  // truth for the star button's saved/unsaved visual state.
+  const matchedSavedView = useMemo<SavedView | null>(() => {
+    if (tokens.length === 0 && aggregation === null) return null;
+    const key = canonicalQueryKey(tokens, aggregation);
+    return (
+      savedViews.find(
+        (v) => canonicalQueryKey(v.tokens, v.aggregation ?? null) === key,
+      ) ?? null
+    );
+  }, [tokens, aggregation, savedViews]);
 
   const itemCount = useMemo(
     () => sections.reduce((acc, s) => acc + s.items.length, 0),
@@ -270,7 +320,14 @@ export function useFacetSearch<T>({
       setInputValueRaw("");
       return;
     }
-    // recent or saved — both replace tokens with their preset
+    if (s.kind === "saved") {
+      // Restore the full query state — tokens AND aggregation.
+      setTokens(s.tokens.map((t) => ({ ...t, id: nextTokenId() })));
+      setAggregationRaw(s.aggregation);
+      setInputValueRaw("");
+      return;
+    }
+    // recent — replace tokens; recents don't carry aggregation.
     setTokens(s.tokens.map((t) => ({ ...t, id: nextTokenId() })));
     setInputValueRaw("");
   }, []);
@@ -292,6 +349,69 @@ export function useFacetSearch<T>({
   const removeToken = useCallback((id: string) => {
     setTokens((prev) => prev.filter((t) => t.id !== id));
   }, []);
+
+  const removeTokensByIds = useCallback((ids: string[]) => {
+    if (ids.length === 0) return;
+    const idSet = new Set(ids);
+    setTokens((prev) => prev.filter((t) => !idSet.has(t.id)));
+  }, []);
+
+  const applyTokens = useCallback(
+    (newTokens: Token[], nlText?: string) => {
+      if (newTokens.length === 0) return;
+      const stamped = newTokens.map((t) => ({ ...t, id: t.id || nextTokenId() }));
+      setTokens((prev) => [...prev, ...stamped]);
+      setInputValueRaw("");
+      // Record this as a recent so users can re-run the same NL query later.
+      setRecents((prev) => {
+        const serial = serialiseTokens(stamped);
+        const dedup = prev.filter(
+          (r) => serialiseTokens(r.tokens) !== serial && r.nlText !== nlText,
+        );
+        const entry: RecentEntry = {
+          tokens: stamped.map((t) => ({ ...t })),
+          savedAt: Date.now(),
+          ...(nlText ? { nlText } : {}),
+        };
+        return [entry, ...dedup].slice(0, RECENTS_LIMIT);
+      });
+    },
+    [],
+  );
+
+  const setAggregation = useCallback((a: Aggregation | null) => {
+    setAggregationRaw(a);
+  }, []);
+
+  const applyNLResult = useCallback(
+    ({ tokens: newTokens, aggregation: newAgg, nlText }: ApplyNLArgs) => {
+      // Stamp new token ids and apply atomically with the aggregation so the
+      // table doesn't paint twice.
+      const stamped = newTokens.map((t) => ({
+        ...t,
+        id: t.id || nextTokenId(),
+      }));
+      if (stamped.length > 0) setTokens((prev) => [...prev, ...stamped]);
+      setAggregationRaw(newAgg);
+      setInputValueRaw("");
+      // Recents only when there's something to record (either new tokens or
+      // an aggregation that differs from a pure existing-state snapshot).
+      if (stamped.length === 0 && !newAgg) return;
+      setRecents((prev) => {
+        const serial = serialiseTokens(stamped);
+        const dedup = prev.filter(
+          (r) => serialiseTokens(r.tokens) !== serial && r.nlText !== nlText,
+        );
+        const entry: RecentEntry = {
+          tokens: stamped.map((t) => ({ ...t })),
+          savedAt: Date.now(),
+          ...(nlText ? { nlText } : {}),
+        };
+        return [entry, ...dedup].slice(0, RECENTS_LIMIT);
+      });
+    },
+    [],
+  );
 
   const editLastToken = useCallback(() => {
     setTokens((prev) => {
@@ -315,6 +435,7 @@ export function useFacetSearch<T>({
   const clearAll = useCallback(() => {
     setTokens([]);
     setInputValueRaw("");
+    setAggregationRaw(null);
   }, []);
 
   const saveCurrentAsRecent = useCallback(() => {
@@ -342,12 +463,40 @@ export function useFacetSearch<T>({
     commitAt,
     commit,
     removeToken,
+    removeTokensByIds,
+    applyTokens,
+    applyNLResult,
+    aggregation,
+    setAggregation,
+    topN,
     editLastToken,
     editToken,
     clearAll,
     saveCurrentAsRecent,
     recents,
+    matchedSavedView,
   };
+}
+
+// Secondary label for a saved-view dropdown row. Priority:
+//   1. nlText (the original NL prompt) — preserves intent for AI searches
+//   2. tokens + " · " + agg summary — for hybrid views
+//   3. tokens alone — classic filter views
+//   4. agg summary alone — agg-only views
+function savedViewLabel<T>(
+  view: SavedView,
+  facetByKey: Map<string, FacetConfig<T>>,
+): string {
+  if (view.nlText) return view.nlText;
+  const tokenPart = view.tokens.length > 0 ? serialiseTokens(view.tokens) : "";
+  const aggPart = view.aggregation
+    ? aggregationSummary(
+        view.aggregation,
+        facetByKey.get(view.aggregation.groupBy)?.label,
+      )
+    : "";
+  if (tokenPart && aggPart) return `${tokenPart} · ${aggPart}`;
+  return tokenPart || aggPart;
 }
 
 function loadRecents(storageKey: string): RecentEntry[] {
@@ -386,7 +535,11 @@ function loadRecents(storageKey: string): RecentEntry[] {
         !isLegacy && typeof item?.savedAt === "number"
           ? item.savedAt
           : Date.now() - 1000 * 60 * 60 * 24 * 7; // legacy → "Nd ago" rather than "just now"
-      out.push({ tokens, savedAt });
+      const nlText =
+        !isLegacy && typeof item?.nlText === "string" && item.nlText.trim()
+          ? item.nlText
+          : undefined;
+      out.push(nlText ? { tokens, savedAt, nlText } : { tokens, savedAt });
     }
     return out;
   } catch {
@@ -402,6 +555,7 @@ function saveRecents(storageKey: string, recents: RecentEntry[]): void {
         isPattern ? { facetKey, value, isPattern } : { facetKey, value },
       ),
       savedAt: entry.savedAt,
+      ...(entry.nlText ? { nlText: entry.nlText } : {}),
     }));
     window.localStorage.setItem(storageKey, JSON.stringify(minimal));
   } catch {

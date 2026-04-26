@@ -1,12 +1,15 @@
 import { Icon } from "@speakeasy-api/moonshine";
 import type { MutableRefObject, ReactNode } from "react";
 import type { Suggestion, Section } from "./useFacetSearch";
+import { EXAMPLE_NL_QUERIES } from "./nl/examples";
 import {
   relativeTime,
   VARIANT_STYLES,
   type FacetConfig,
   type MatchedSuggestion,
 } from "./types";
+
+export type NLSuggestionsMode = "armed" | "failed" | "unavailable";
 
 interface FacetSuggestionsProps<T> {
   sections: Section[];
@@ -23,6 +26,10 @@ interface FacetSuggestionsProps<T> {
   totalRows: number;
   filteredCount: number;
   listboxId: string;
+  // NL-mode override: when set, replaces the regular sections with an NL hint /
+  // failure / unavailable view. `onNLExample` is required when nlMode is set.
+  nlMode?: NLSuggestionsMode;
+  onNLExample?: (text: string) => void;
 }
 
 export function FacetSuggestions<T>({
@@ -38,9 +45,33 @@ export function FacetSuggestions<T>({
   totalRows,
   filteredCount,
   listboxId,
+  nlMode,
+  onNLExample,
 }: FacetSuggestionsProps<T>) {
   let flatIndex = 0;
   const isEmpty = sections.every((s) => s.items.length === 0);
+
+  // NL-mode panes replace the regular sections entirely.
+  if (nlMode) {
+    return (
+      <div
+        role="listbox"
+        id={listboxId}
+        className="w-full overflow-hidden rounded-xl border border-violet-500/30 bg-zinc-950/95 backdrop-blur-md shadow-2xl shadow-black/60 ring-1 ring-violet-500/10"
+        data-nl-mode={nlMode}
+      >
+        <NLPane mode={nlMode} onPick={onNLExample} />
+        <div className="flex items-center justify-between border-t border-zinc-800/60 bg-zinc-950/80 px-3 py-1.5 text-[11px] text-zinc-500">
+          <div className="flex items-center gap-3">
+            <KeyHint>↵</KeyHint>
+            <span>ask</span>
+            <KeyHint>esc</KeyHint>
+            <span>cancel</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -185,13 +216,21 @@ function SuggestionRow<T>({
   }
 
   if (item.kind === "saved") {
+    // NL-derived views: render the prompt italic + non-mono so it reads as prose;
+    // filter/agg views keep the mono technical label.
+    const isNL = !!item.nlText;
     return (
       <>
-        <span aria-hidden className="text-amber-300">
+        <span aria-hidden className={isNL ? "text-violet-300" : "text-amber-300"}>
           <Icon name="star" size="small" />
         </span>
         <span className="flex-shrink-0 truncate text-zinc-100">{item.name}</span>
-        <span className="ml-1 flex-1 truncate font-mono text-[11px] text-zinc-500">
+        <span
+          className={[
+            "ml-1 flex-1 truncate text-[11px] text-zinc-500",
+            isNL ? "italic" : "font-mono",
+          ].join(" ")}
+        >
           {item.label}
         </span>
         {onRemoveSaved && (
@@ -277,5 +316,88 @@ function KeyHint({ children }: { children: ReactNode }) {
     <kbd className="rounded border border-zinc-700/60 bg-zinc-800/60 px-1 py-0 font-mono text-[10px] leading-4 text-zinc-300">
       {children}
     </kbd>
+  );
+}
+
+function NLPane({
+  mode,
+  onPick,
+}: {
+  mode: NLSuggestionsMode;
+  onPick?: (text: string) => void;
+}) {
+  if (mode === "unavailable") {
+    return (
+      <div
+        className="px-4 py-4 text-sm"
+        role="status"
+        aria-live="polite"
+      >
+        <div className="flex items-start gap-2 text-zinc-300">
+          <span aria-hidden className="mt-0.5 text-zinc-500">
+            <Icon name="info" size="small" />
+          </span>
+          <div>
+            <p className="text-zinc-200">
+              Natural language search isn't supported in this browser.
+            </p>
+            <p className="mt-1 text-zinc-500">
+              Try{" "}
+              <span className="font-mono text-zinc-300">5xx</span>,{" "}
+              <span className="font-mono text-zinc-300">GET</span>, or any{" "}
+              <span className="font-mono text-zinc-300">facet:value</span> pair.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const heading =
+    mode === "armed"
+      ? "Try natural language"
+      : "Couldn't parse — try one of these";
+  const sub =
+    mode === "armed"
+      ? "Type a question, or pick an example to run it."
+      : "We couldn't extract any filters from that query.";
+
+  return (
+    <div className="py-2">
+      <div className="px-3 pb-1.5 pt-1">
+        <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-violet-300">
+          <SparkleSm />
+          <span>{heading}</span>
+        </div>
+        <p className="mt-1 text-[11px] text-zinc-500">{sub}</p>
+      </div>
+      <ul className="flex flex-col">
+        {EXAMPLE_NL_QUERIES.map((text) => (
+          <li key={text}>
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => onPick?.(text)}
+              className="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-sm text-zinc-300 hover:bg-violet-500/10 hover:text-violet-100 transition-colors"
+            >
+              <span aria-hidden className="text-violet-300/70">
+                <SparkleSm />
+              </span>
+              <span className="font-mono text-zinc-200 group-hover:text-violet-100">
+                {text}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function SparkleSm() {
+  return (
+    <svg aria-hidden viewBox="0 0 24 24" width={11} height={11} className="fill-current">
+      <path d="M12 3l1.9 4.9L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-2.1L12 3z" />
+    </svg>
   );
 }

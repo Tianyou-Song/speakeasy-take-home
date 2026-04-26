@@ -28,6 +28,24 @@ export interface Token {
   isPattern?: boolean;
 }
 
+// Phase 4: analytical / aggregation queries.
+// `count` is the only aggregator for v1 — keeping the field in the type so
+// avg/min/max/p95 can be added as a localized change later.
+export type AggregationOrder = "count_desc" | "count_asc";
+
+export interface Aggregation {
+  groupBy: string;            // facet key — validated against live schema
+  aggregator: "count";
+  orderBy: AggregationOrder;
+  limit: number;              // 1..20
+}
+
+export interface TopNRow {
+  value: string;
+  count: number;
+  share: number;              // 0..1, count / total considered
+}
+
 export type Draft =
   | { mode: "idle"; text: string }
   | { mode: "value"; facetKey: string; partial: string };
@@ -92,6 +110,39 @@ export function resolveChipDisplay<T>(
 
 export function serialiseTokens(tokens: Token[]): string {
   return tokens.map((t) => `${t.facetKey}:${t.value}`).join(" ");
+}
+
+// Order-independent identity key for tokens; thin wrapper over canonicalQueryKey.
+export function canonicalTokenKey(tokens: Token[]): string {
+  return canonicalQueryKey(tokens, null);
+}
+
+// Full-state identity key: tokens + aggregation. Two queries that describe the
+// same reproducible result (same filters AND same group-by/order/limit) produce
+// the same key. The "|" separator keeps the token segment from colliding with
+// the agg segment when one side is empty.
+export function canonicalQueryKey(
+  tokens: Token[],
+  aggregation: Aggregation | null,
+): string {
+  const t = tokens
+    .map((x) => `${x.facetKey}:${x.value}${x.isPattern ? "*" : ""}`)
+    .sort()
+    .join(" ");
+  const a = aggregation
+    ? `${aggregation.groupBy}:${aggregation.aggregator}:${aggregation.orderBy}:${aggregation.limit}`
+    : "";
+  return `${t}|${a}`;
+}
+
+// Display-friendly summary of an aggregation, e.g. "Top 5 by domain".
+export function aggregationSummary(
+  aggregation: Aggregation,
+  facetLabel?: string,
+): string {
+  const dir = aggregation.orderBy === "count_asc" ? "Bottom" : "Top";
+  const label = facetLabel ?? aggregation.groupBy;
+  return `${dir} ${aggregation.limit} by ${label}`;
 }
 
 export function isPatternValue(value: string): boolean {

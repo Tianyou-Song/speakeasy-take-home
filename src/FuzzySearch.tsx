@@ -57,7 +57,6 @@ export function FuzzySearch({ data, onChange }: FuzzySearchProps) {
         rows={data}
         facets={facets}
         onFilteredChange={onChange}
-        placeholder="Filter logs… (try `method:`, `status:`, `domain:`, `path:`)"
         storageKey="speakeasy-fuzzy-search:recents:v1"
       />
     </div>
