@@ -37,8 +37,27 @@ const columns: Column<HttpLog>[] = [
 function App() {
   const [data, setData] = useState<HttpLog[]>(sampleData);
   return (
-    <div className="my-10 flex flex-col items-center gap-14 justify-start h-full">
+    <div className="mx-auto my-10 flex h-full max-w-3xl flex-col gap-6 px-6 text-left">
+      <header className="flex flex-col gap-1">
+        <h1 className="text-xl font-semibold tracking-tight text-zinc-100">
+          HTTP Logs
+        </h1>
+        <p className="text-sm text-zinc-500">
+          {sampleData.length} events · sample dataset · filter by{" "}
+          <span className="font-mono text-zinc-400">method</span>,{" "}
+          <span className="font-mono text-zinc-400">status</span>,{" "}
+          <span className="font-mono text-zinc-400">domain</span>, or{" "}
+          <span className="font-mono text-zinc-400">path</span>
+        </p>
+      </header>
+
       <FuzzySearch data={sampleData} onChange={setData} />
+
+      <div className="text-xs text-zinc-500">
+        {data.length === sampleData.length
+          ? `Showing all ${sampleData.length} events`
+          : `Showing ${data.length} of ${sampleData.length} events`}
+      </div>
 
       <Table
         data={data}
