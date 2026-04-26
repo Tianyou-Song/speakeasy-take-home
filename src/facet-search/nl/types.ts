@@ -1,4 +1,4 @@
-import type { Aggregation, Token } from "../types";
+import type { Aggregation, FacetType, Token } from "../types";
 
 export type NLEngineStatus = "cold" | "loading" | "ready" | "failed";
 
@@ -25,8 +25,10 @@ export interface NLResult {
   aggregation: Aggregation | null;
 }
 
-// Validation only needs the facet keys, so accept the structural minimum.
-export type NLFacetSchema = ReadonlyArray<{ key: string }>;
+// Validation needs the facet keys and (optionally) the type so it can reject
+// numeric ops on non-numeric facets. Structural minimum keeps engine.parse
+// callable from tests with synthetic facet schemas.
+export type NLFacetSchema = ReadonlyArray<{ key: string; type?: FacetType }>;
 
 export interface NLEngine {
   readonly status: NLEngineStatus;

@@ -1,3 +1,4 @@
+import type { LiqeQuery } from "liqe";
 import type { ReactNode } from "react";
 
 export type FacetType = "enum" | "string" | "number";
@@ -21,11 +22,15 @@ export interface FacetConfig<T> {
   chipVariant?: (value: string | number) => ChipVariant;
 }
 
+export type Op = ">" | ">=" | "<" | "<=" | "..";
+
 export interface Token {
   id: string;
   facetKey: string;
   value: string;
   isPattern?: boolean;
+  negated?: boolean;
+  op?: Op;
 }
 
 // Phase 4: analytical / aggregation queries.
@@ -48,7 +53,7 @@ export interface TopNRow {
 
 export type Draft =
   | { mode: "idle"; text: string }
-  | { mode: "value"; facetKey: string; partial: string };
+  | { mode: "value"; facetKey: string; partial: string; negated: boolean };
 
 export interface MatchedSuggestion {
   key: string;
@@ -108,8 +113,18 @@ export function resolveChipDisplay<T>(
   };
 }
 
+// Canonical written form of a single token: leading "-" for negation; ASCII
+// comparators (">=", "<=", ">", "<"); ".." infix for ranges. The "!" inline
+// negation form is parsed but never produced.
+export function serialiseToken(t: Token): string {
+  const prefix = t.negated ? "-" : "";
+  if (t.op === "..") return `${prefix}${t.facetKey}:${t.value}`;
+  if (t.op) return `${prefix}${t.facetKey}:${t.op}${t.value}`;
+  return `${prefix}${t.facetKey}:${t.value}`;
+}
+
 export function serialiseTokens(tokens: Token[]): string {
-  return tokens.map((t) => `${t.facetKey}:${t.value}`).join(" ");
+  return tokens.map(serialiseToken).join(" ");
 }
 
 // Order-independent identity key for tokens; thin wrapper over canonicalQueryKey.
@@ -125,10 +140,7 @@ export function canonicalQueryKey(
   tokens: Token[],
   aggregation: Aggregation | null,
 ): string {
-  const t = tokens
-    .map((x) => `${x.facetKey}:${x.value}${x.isPattern ? "*" : ""}`)
-    .sort()
-    .join(" ");
+  const t = tokens.map(serialiseToken).sort().join(" ");
   const a = aggregation
     ? `${aggregation.groupBy}:${aggregation.aggregator}:${aggregation.orderBy}:${aggregation.limit}`
     : "";
@@ -152,6 +164,81 @@ export function isPatternValue(value: string): boolean {
 export function isPatternFacet<T>(facet: FacetConfig<T>): boolean {
   // Wildcards add no value on enums (finite known set); restrict to string/number.
   return facet.type !== "enum";
+}
+
+// Canonical query state. Two modes:
+//   - "simple": flat AND of facet predicates → renders as conventional chip rail.
+//     Every existing typed/NL query falls here, so the simple shape is the
+//     overwhelmingly common case and back-compat path.
+//   - "advanced": anything that doesn't flatten (cross-facet OR, deep parens,
+//     mixed AND/OR with cross-facet predicates, regex literals). Renders as
+//     a single "advanced query" chip with the raw text. Click-to-edit puts
+//     the text back in the input.
+//
+// `text` on advanced is the canonical user-typed source; `ast` is the parsed
+// liqe expression used for evaluation. Keeping both means we round-trip
+// exactly through URL/storage without re-stringifying liqe's AST (which
+// loses incidental whitespace and quoting).
+export type Query =
+  | { mode: "simple"; tokens: Token[] }
+  | { mode: "advanced"; text: string; ast: LiqeQuery };
+
+export const EMPTY_QUERY: Query = { mode: "simple", tokens: [] };
+
+export function isSimpleQuery(
+  q: Query,
+): q is { mode: "simple"; tokens: Token[] } {
+  return q.mode === "simple";
+}
+
+// Tokens-only convenience: simple → its token list, advanced → []. Used by the
+// chip rail when the consumer only renders simple chips and the advanced-mode
+// chip is rendered separately.
+export function tokensOf(query: Query): Token[] {
+  return query.mode === "simple" ? query.tokens : [];
+}
+
+// Canonical written form of a Query — what URL `?q=` writes and saved views
+// store. Simple mode joins serialised tokens with whitespace (implicit AND);
+// advanced mode emits the user's typed text verbatim so quoting/parens
+// survive round-trips.
+export function serialiseQuery(query: Query): string {
+  return query.mode === "simple"
+    ? serialiseTokens(query.tokens)
+    : query.text;
+}
+
+// Flatten a row to `{ [facetKey]: value }` for liqe's reflection-based
+// filter/test. Liqe walks the row by field name (e.g. `domain:foo` reads
+// `row.domain`), so a row whose facets are sourced from accessors must be
+// projected first. Numbers stay as numbers so `status:>=400` does numeric
+// comparison rather than string lexical compare.
+export function projectRow<T>(
+  row: T,
+  facets: FacetConfig<T>[],
+): Record<string, string | number> {
+  const out: Record<string, string | number> = {};
+  for (const facet of facets) out[facet.key] = getFacetValue(row, facet);
+  return out;
+}
+
+// Mouse-only `~` button on a dropdown row commits a wildcard-style chip
+// derived from the row's literal value. Numeric facets get the HTTP-class
+// `<first-digit>*` form (e.g. `500` → `5*`); string facets get
+// `*value*` (contains). Enums fall through to the literal value, but
+// `FacetSuggestions` should hide the button on enum rows so this branch
+// is never reached in practice — keeping it makes the helper safe to call
+// from any future surface.
+export function derivePatternFromValue(
+  value: string,
+  facetType: FacetType,
+): string {
+  if (facetType === "number") {
+    const first = value.match(/^[0-9]/)?.[0];
+    return first ? `${first}*` : value;
+  }
+  if (facetType === "string") return `*${value}*`;
+  return value;
 }
 
 export function relativeTime(savedAt: number, now: number = Date.now()): string {

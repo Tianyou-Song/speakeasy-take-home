@@ -19,18 +19,77 @@ Open the URL Vite prints. Click the input (or press `Cmd/Ctrl+K` from anywhere).
 | Open suggestions | Click / focus the input, or `Cmd/Ctrl+K` | Click the input |
 | Pick a facet (`method`, `status`, `domain`, `path`) | type / arrow + `Enter` or `Tab` | click the row |
 | Pick a value | type / arrow + `Enter` or `Tab` | click the row |
-| Wildcard match | type `status:5*`, `path:*/auth/*` | — |
+| **Negate a filter** | type `-status:500` (or `status:!500`, or `NOT method:GET`) | click the `−` button on any value/pattern/range row |
+| **Apply (positive)** | type / arrow + `Enter` | click row body, or click the `+` button |
+| Wildcard match | type `status:5*`, `path:*/auth/*` | click the `~` button on a value row |
+| Numeric comparison | type `status:>=400`, `status:<300` | — |
+| Numeric range | type `status:200..299` *or* `status:[400 TO 499]` (inclusive) / `status:{400 TO 499}` (exclusive) | — |
+| **Cross-facet AND/OR** | type `method:GET AND status:200`, `(method:GET OR method:POST) AND status:>=400` | click any footer hint to insert the syntax |
+| **Same-facet union** | type `domain:(speakeasy.com OR openai.com)` | — |
+| **Navigate the chip rail** | `←` from the input focuses the rightmost chip; `←`/`→`/`Home`/`End` move within the rail | click any chip |
+| **Edit a chip** | focus a chip + `Enter` (or `F2`); `Backspace` on empty input pops the last one | click the chip body |
+| **Remove a chip** | focus a chip + `Backspace` / `Delete` | click `×` on the chip |
 | Save current filters as a view | — | click ★ in the input shell |
 | Apply a saved view / recent | type / arrow + `Enter` | click the row |
-| Edit the last chip | `Backspace` on empty input | click the chip body |
-| Remove a specific chip | — | click `×` on the chip |
 | Clear everything | click `Clear` | click `Clear` |
 | Close suggestions | `Esc` | click outside |
 
+The `+` / `−` button pair on each value/pattern/range row is the canonical
+mouse-only path to negation. Pattern research: Kibana Discover hides
+filter-for / filter-out icons behind hover (clean but undiscoverable); Datadog
+uses a click-popover with two named links (one extra click); Sentry uses an
+ellipsis-revealed context menu (two extra clicks). Linear, Notion, and
+Airtable keep operator controls *always visible* on the filter row, which is
+what we adopted: the buttons are styled muted at rest (low-saturation border,
+dimmed glyph) so they don't compete with the value text, brighten on hover,
+and the button matching the current typed-draft polarity gets a ring so the
+user can see at a glance which one matches "Enter" / row-body click. With ≤10
+rows per facet in a typical dropdown, always-visible was the right
+discoverability/density tradeoff — hover-only would only make sense at
+table-cell density.
+
 Filtering semantics match DataDog / Sentry: **AND** across different facets, **OR** within
-the same facet. Adjacent same-facet chips render with a small `OR` connector to make the
-semantics visible. Wildcards (`*`) compile to anchored, case-insensitive regex and are
-restricted to non-enum facets.
+the same facet (positives are unioned). Negated chips of the same facet are AND'd as
+exclusions on top — `status:200 -status:404` reads as "status is 200 and not 404". The
+chip rail renders an inline `or` connector between adjacent same-polarity, same-facet
+chips and a small `and` between positives and negatives. Wildcards (`*`) compile to
+anchored, case-insensitive regex and are restricted to non-enum facets. Numeric
+operators (`>`, `>=`, `<`, `<=`, `..`) only apply to numeric facets — typing
+`domain:>foo` surfaces a non-committable hint in the dropdown rather than silently
+failing. Two input forms are accepted for negation; the canonical written form
+(used for chip-edit, URL sync, and saved-view restore) is always `-`, never `!`.
+
+### Simple vs. advanced mode (chip flatten)
+
+The full Datadog DSL — cross-facet `AND`/`OR`, parens at any depth, bracket ranges,
+boolean `NOT`, quoted strings — is parsed via [`liqe`](https://github.com/gajus/liqe)
+into an expression tree. Two render modes flow from the AST:
+
+- **Simple mode** — when the AST flattens to a flat AND of facet predicates (with
+  optional same-facet OR groups and negations), each predicate becomes a chip and
+  the existing per-facet evaluator handles filtering. This is the common case;
+  every PDF-suggested form, every NL output, every URL written by older builds,
+  and forms like `(method:GET OR method:POST) AND status:>=400` all flatten.
+- **Advanced mode** — when the AST has cross-facet OR (e.g.
+  `(method:GET AND status:500) OR (method:POST AND status:404)`) or other
+  shapes that can't be faithfully represented as a flat chip list, the chip rail
+  collapses to a single dotted-border "Advanced" chip showing the raw text. Click
+  to edit puts the text back in the input; the AST evaluator runs against rows
+  using the same per-tag matchTokenValue semantics as simple mode (so a domain
+  literal stays exact-match in advanced just like in simple — no liqe substring
+  drift). Datadog's own UI does the same fallback for queries it can't render
+  as facets.
+
+Round-trips losslessly through URL `?q=` and saved views — advanced text is
+preserved verbatim, simple chips serialise canonically.
+
+### Shareable URLs
+
+The current chip set and aggregation are mirrored into the URL as `?q=...&agg=...`
+(replaceState, debounced 250 ms — no history pollution from typing). Reload and the
+filters come back; copy-paste the URL into another tab to share. The `?q=` value is the
+exact string the input produces, so a hand-edited URL like
+`?q=method:GET+-status:500+status:>=400` Just Works.
 
 Recently-committed queries and named *Saved Views* persist to `localStorage` under
 separate keys; both surface in the dropdown when the input is empty. Recents show
@@ -152,21 +211,21 @@ later is a localized change.
 src/
   FuzzySearch.tsx              thin wrapper: declares the HttpLog facet config
   facet-search/
-    FacetSearch.tsx            input shell + chip rail + Floating-UI dropdown
+    FacetSearch.tsx            input shell + chip rail + Floating-UI dropdown; `nuqs` URL sync; `react-hotkeys-hook` ⌘K
     FacetSuggestions.tsx       sectioned dropdown (Facets / Values / Saved / Recent / NL)
-    FacetChip.tsx              colour-coded chip (italic + dashed for patterns)
+    FacetChip.tsx              colour-coded chip (italic+dashed for patterns; − glyph for negation; ≥/≤/– for ranges)
     AskButton.tsx              ✨ Ask trigger; disabled state + tooltip when NL unavailable
     NLLoadingProgress.tsx      progress bar shown in the input while WebLLM downloads
     NLPill.tsx                 "Translated …" undo pill with auto-dismiss timer
     AggregationChip.tsx        "📊 Top 5 by path" chip-styled pill in the chip rail
     TopByPanel.tsx             horizontal-bar Top-N panel; click row -> add filter chip
-    useFacetSearch.ts          state hook (tokens, draft, aggregation, topN, recents)
-    useSavedViews.ts           saved-views hook (localStorage, separate key)
-    parse.ts                   parseDraft(input) → { mode, facetKey?, partial }
-    filter.ts                  filterRows + uniqueValuesForFacet + matchToken (wildcard)
+    useFacetSearch.ts          state hook (tokens, draft, aggregation, topN, recents) — recents persist via `usehooks-ts`
+    useSavedViews.ts           saved-views hook — `usehooks-ts` `useLocalStorage` (cross-tab sync) + schema-validated migration
+    parse.ts                   parseDraft + parseValuePart (op/range/inline-!) + parseSerialisedQuery
+    filter.ts                  filterRows + uniqueValuesForFacet + matchTokenValue (wildcard, op, range)
     aggregate.ts               topNBy(rows, facet, agg) → ranked groups + counts + share
     match.ts                   subsequence fuzzy matcher with highlight ranges
-    types.ts                   Token, FacetConfig, Aggregation, TopNRow, ChipVariant
+    types.ts                   Token (negated/op), FacetConfig, Aggregation, Op, TopNRow, ChipVariant, serialiseToken
     nl/
       capability.ts            detectWebGPU() — memoized one-shot check on mount
       types.ts                 NLEngine interface, NLLoadProgress, NLResult
@@ -212,9 +271,28 @@ state-machine, nothing to drift out of sync.
 
 ### Why these dependencies
 
+Wherever a community-standard primitive exists for a piece of plumbing,
+we use it. Rolling these by hand — dropdown positioning, URL state, the
+⌘K listener, localStorage with cross-tab sync — is where most takehomes
+drop quality.
+
+- **`liqe`** — Lucene-compatible parser + AST for the typed Datadog DSL
+  (cross-facet `AND`/`OR`/`NOT`, parens at any depth, `[a TO b]` ranges,
+  comparators, quoted literals, escapes). 672★, TypeScript-first, ships
+  the AST shape we walk to flatten to chips. The competing `lucene` parser
+  (bripkens, 346K dl/mo) ships parser + serializer only — using it would
+  mean hand-writing ~150 lines of AST-walking evaluator for the same
+  semantics liqe gives us in `parse()`. We pre-normalise the few Datadog
+  forms liqe doesn't natively accept (`field:(a OR b)` value groups,
+  `field:N..M` shorthand) into liqe-canonical equivalents before parsing,
+  and flatten back to chips for the simple-mode render path. The simple-mode
+  evaluator is unchanged from the pre-liqe build (per-tag exact-match /
+  wildcard / op semantics), so liqe contributes parsing only — not
+  evaluation — keeping leaf semantics consistent across simple and
+  advanced modes.
 - **`@floating-ui/react`** — anchored dropdown positioning (offset / flip / shift / size),
   scroll/resize tracking via `autoUpdate`, ARIA-correct list navigation. The same primitive
-  Linear, GitHub, and Radix use; rolling these by hand is where most takehomes drop quality.
+  Linear, GitHub, and Radix use.
 - **`@mlc-ai/web-llm`** — production-grade WebGPU runtime for browser-local LLMs.
   Dynamic-imported (`await import("@mlc-ai/web-llm")`) so Vite code-splits
   the ~5 MB SDK into its own chunk that's never in the main bundle. Both
@@ -222,6 +300,20 @@ state-machine, nothing to drift out of sync.
   eagerly on app mount via `requestIdleCallback` (deferred just past first
   paint), then persisted in Cache Storage so subsequent visits load from
   disk in <5 s.
+- **`nuqs`** — type-safe URL state for `?q=` / `?agg=` via `useQueryState`.
+  Production-validated at Vercel / Sentry / Supabase / Clerk. Throttled
+  writes, `null`-removes-param, `history: "replace"`, and SSR-safe defaults
+  out of the box — replaces a hand-rolled `useUrlSync` hook with a
+  StrictMode-double-invocation guard.
+- **`react-hotkeys-hook`** — `useHotkeys("mod+k", ..., { enableOnFormTags: true })`
+  replaces a `document.addEventListener` and gives platform-aware `Cmd`/`Ctrl`
+  resolution for free. The same primitive will scope the chip-rail keyboard
+  navigation (Arrow/Backspace/Enter on individual chips) when that lands.
+- **`usehooks-ts`** `useLocalStorage` — backs both saved views and recents.
+  Adds **cross-tab sync** via the `storage` event (open the app in two tabs,
+  save a view in one, the other updates within ~100 ms — new behavior the
+  hand-rolled version lacked) and consolidates SSR / quota / private-mode
+  error handling.
 - That's it. The fuzzy matcher (`match.ts`, ~80 lines) is in-tree because deterministic
   ranking + cheap highlight ranges matter more than the breadth of `fuse.js` for the
   cardinalities we care about.
@@ -246,13 +338,14 @@ is *who provides the facets and values* — none of the UI changes.
 3. **Virtualised dropdown.** Once an item count crosses ~50, swap the listbox `<ul>` for
    `@tanstack/react-virtual`. Keeps frame time flat when a facet has thousands of distinct
    values.
-4. **Server-side filtering.** Tokens already serialise cleanly to a query DSL —
-   `tokens.map(t => `${t.facetKey}:${t.value}`).join(' ')` is one line. Local filtering
-   becomes the small-dataset fallback. The DSL extends naturally to the operators DataDog
-   exposes (`AND`, `OR`, `NOT`, `(...)`, ranges, wildcards) — the token model already
-   supports it; only the parser would need to ship.
-5. **Persistence.** Tokens ↔ URL `?q=...` (deep links / shareable filters). Recent queries
-   go server-side per user once we have user accounts; saved views likewise.
+4. **Server-side filtering.** Tokens already serialise cleanly to a query DSL via
+   `serialiseTokens(tokens)` — wildcards, negation (`-`), comparators (`>=`/`<=`/`>`/`<`),
+   and ranges (`200..299`) all round-trip through one line. The remaining DataDog
+   operators (`(...)` grouping, `AND`/`OR` infix keywords) would extend naturally as the
+   token model already supports them; only the parser would need to ship.
+5. **URL ↔ tokens** ships today via `nuqs` (`?q=...&agg=...` with throttled
+   `replaceState`); recent queries and saved views go server-side per user once accounts
+   exist.
 6. **Telemetry.** Emit `facet_search.committed` and `facet_search.abandoned_after_ms`
    events so PM can see which facets actually get used.
 7. **Defensive cardinality cap.** Even with virtualisation, refuse to render more than
@@ -263,16 +356,28 @@ doesn't shift.
 
 ## What's deliberately out of scope
 
-- Full boolean / parens DSL — the token model supports it (wildcards already ship), but
-  explicit `NOT` and grouped expressions are left for the productionisation step. v1 is
-  AND across facets, OR within a facet, plus glob wildcards.
-- Numeric range support (`status:>=400`) — straightforward extension once an `op` is added
-  to `Token`.
+- `@attribute:value` and `tags:"..."` syntax — Datadog's tag and structured-attribute
+  forms have no analogue in our schema (`HttpLog` rows have no nested attributes
+  or tag column).
+- Full-text `*:term` search — there's no `message` body field on `HttpLog`, so
+  there's nothing to free-text against. Free text + Enter routes to NL instead.
+- CIDR / IP-range functions (`@network.client.ip:cidr(10.0.0.0/8)` etc.) — no
+  IP fields in the schema.
+- Fuzzy (`~`) and proximity (`~N`) operators, term boosting (`^N`) — these are
+  Lucene constructs that Datadog's logs/trace syntax also omits.
+- Re-collapsing N same-facet tokens into a single `field:(a OR b)` chip on
+  serialisation — predictable URL form and lossless chip-edit are worth more
+  than the visual compactness; the inline `or` connector conveys the grouping.
 - Server-side saved views — `useSavedViews` is `localStorage`-backed; swap the storage
   layer for a fetch-based one without touching the UI.
 - Virtualised dropdown — only matters past ~50 items; demo dataset has ≤10 per facet.
 - Unit tests — the pure layer (`parse`, `filter`, `match`, `relativeTime`,
-  `compilePattern`) is shaped for them, but they're not wired up.
+  `compilePattern`) is shaped for them, but the take-home is a POC where the code is
+  subject to dramatic changes; manual browser walkthroughs are the verification net.
+- `popstate` / browser back-forward URL navigation — the URL sync uses `replaceState`,
+  not `pushState`, so the back button doesn't step through every keystroke. Wiring up
+  `popstate` for URL-driven undo adds re-entry gates and isn't worth the complexity at
+  this scale.
 
 ## AI tooling disclosure
 

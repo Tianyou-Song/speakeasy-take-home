@@ -3,6 +3,7 @@ import type { MutableRefObject, ReactNode } from "react";
 import type { Suggestion, Section } from "./useFacetSearch";
 import { EXAMPLE_NL_QUERIES } from "./nl/examples";
 import {
+  derivePatternFromValue,
   relativeTime,
   VARIANT_STYLES,
   type FacetConfig,
@@ -26,6 +27,10 @@ interface FacetSuggestionsProps<T> {
   totalRows: number;
   filteredCount: number;
   listboxId: string;
+  // Click-to-insert from the syntax-hint footer / NL examples puts the
+  // example text into the input. The mouse-only path to discovering
+  // typed-syntax features that don't have a value-row equivalent.
+  onSyntaxHintInsert?: (text: string) => void;
   // NL-mode override: when set, replaces the regular sections with an NL hint /
   // failure / unavailable view. `onNLExample` is required when nlMode is set.
   nlMode?: NLSuggestionsMode;
@@ -45,6 +50,7 @@ export function FacetSuggestions<T>({
   totalRows,
   filteredCount,
   listboxId,
+  onSyntaxHintInsert,
   nlMode,
   onNLExample,
 }: FacetSuggestionsProps<T>) {
@@ -125,6 +131,7 @@ export function FacetSuggestions<T>({
                           item={item}
                           facetByKey={facetByKey}
                           onRemoveSaved={onRemoveSaved}
+                          onSelect={onSelect}
                         />
                       </li>
                     );
@@ -151,22 +158,61 @@ export function FacetSuggestions<T>({
       </div>
 
       {!isEmpty && (
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-zinc-800/40 bg-zinc-950/70 px-3 py-1.5 text-[10.5px] text-zinc-500">
-          <SyntaxHint label="Wildcard" example="status:5*" />
-          <SyntaxHint label="Union" example="status:200 status:404" />
-          <SyntaxHint label="Combine" example="method:GET status:200" />
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-zinc-800/40 bg-zinc-950/70 px-3 py-1.5 text-[10.5px] text-zinc-500">
+          <SyntaxHint label="Wildcard" example="status:5*" onInsert={onSyntaxHintInsert} />
+          <SyntaxHint label="Exclude" example="-status:500" onInsert={onSyntaxHintInsert} />
+          <SyntaxHint label="Range" example="status:[400 TO 499]" onInsert={onSyntaxHintInsert} />
+          <SyntaxHint label="Between" example="status:200..299" onInsert={onSyntaxHintInsert} />
+          <SyntaxHint
+            label="Union"
+            example="domain:(speakeasy.com OR openai.com)"
+            onInsert={onSyntaxHintInsert}
+          />
+          <SyntaxHint
+            label="Combine"
+            example="method:GET AND status:200"
+            onInsert={onSyntaxHintInsert}
+          />
+          <SyntaxHint label="Negate" example="NOT method:GET" onInsert={onSyntaxHintInsert} />
         </div>
       )}
     </div>
   );
 }
 
-function SyntaxHint({ label, example }: { label: string; example: string }) {
+// Click-to-insert footer hint. The button is a visible mouse-only path to
+// discovering typed-syntax features (Union/Combine/Negate) that have no
+// equivalent value-row affordance. When `onInsert` is omitted the hint
+// falls back to a non-interactive label.
+function SyntaxHint({
+  label,
+  example,
+  onInsert,
+}: {
+  label: string;
+  example: string;
+  onInsert?: (text: string) => void;
+}) {
+  if (!onInsert) {
+    return (
+      <span className="inline-flex items-center gap-1.5">
+        <span className="uppercase tracking-wider text-zinc-600">{label}</span>
+        <span className="font-mono text-zinc-400">{example}</span>
+      </span>
+    );
+  }
   return (
-    <span className="inline-flex items-center gap-1.5">
+    <button
+      type="button"
+      tabIndex={-1}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={() => onInsert(example)}
+      title={`Insert example: ${example}`}
+      className="inline-flex items-center gap-1.5 rounded px-1 -mx-1 hover:bg-white/[0.04] hover:text-zinc-300 transition-colors"
+    >
       <span className="uppercase tracking-wider text-zinc-600">{label}</span>
       <span className="font-mono text-zinc-400">{example}</span>
-    </span>
+    </button>
   );
 }
 
@@ -174,10 +220,12 @@ function SuggestionRow<T>({
   item,
   facetByKey,
   onRemoveSaved,
+  onSelect,
 }: {
   item: Suggestion;
   facetByKey: Map<string, FacetConfig<T>>;
   onRemoveSaved?: (viewId: string) => void;
+  onSelect: (item: Suggestion) => void;
 }) {
   if (item.kind === "facet") {
     return (
@@ -201,16 +249,26 @@ function SuggestionRow<T>({
     const display = facet?.formatOptionValue?.(item.value) ?? item.value;
     return (
       <>
-        <span
-          aria-hidden
-          className={["h-1.5 w-1.5 rounded-full", VARIANT_STYLES[variant].dot].join(" ")}
-        />
+        {item.negated ? (
+          <span
+            aria-hidden
+            className="font-mono text-rose-300/90 leading-none w-2 -mr-0.5"
+          >
+            −
+          </span>
+        ) : (
+          <span
+            aria-hidden
+            className={["h-1.5 w-1.5 rounded-full", VARIANT_STYLES[variant].dot].join(" ")}
+          />
+        )}
         <span className="flex-1 truncate font-mono text-zinc-200">
           <Highlighted text={String(display)} match={item.match} />
         </span>
         <span className="ml-2 font-mono text-[11px] text-zinc-500">
           {item.count.toLocaleString()}
         </span>
+        <ValueActionButtons item={item} facet={facet} onSelect={onSelect} />
       </>
     );
   }
@@ -256,12 +314,18 @@ function SuggestionRow<T>({
     const noMatches = item.matchCount === 0;
     return (
       <>
-        <span aria-hidden className="text-sky-400">
-          <Icon name="asterisk" size="small" />
+        <span aria-hidden className={item.negated ? "text-rose-300/90" : "text-sky-400"}>
+          {item.negated ? (
+            <span className="font-mono leading-none">−</span>
+          ) : (
+            <Icon name="asterisk" size="small" />
+          )}
         </span>
         <span className="flex-1 truncate font-mono text-zinc-100">
-          <span className="text-zinc-500">Use pattern: </span>
-          <span className="italic">{item.facetKey}:{item.pattern}</span>
+          <span className="text-zinc-500">{item.negated ? "Exclude pattern: " : "Use pattern: "}</span>
+          <span className="italic">
+            {item.negated ? "-" : ""}{item.facetKey}:{item.pattern}
+          </span>
         </span>
         <span
           className={[
@@ -273,6 +337,62 @@ function SuggestionRow<T>({
             ? "no matches"
             : `${item.matchCount} value${item.matchCount === 1 ? "" : "s"} · ${item.rowCount} row${item.rowCount === 1 ? "" : "s"}`}
         </span>
+        <ValueActionButtons item={item} facet={facetByKey.get(item.facetKey)} onSelect={onSelect} />
+      </>
+    );
+  }
+
+  if (item.kind === "range") {
+    const opGlyph =
+      item.op === ">="
+        ? "≥"
+        : item.op === "<="
+          ? "≤"
+          : item.op === ".."
+            ? ""
+            : item.op;
+    const valueDisplay =
+      item.op === ".." ? item.value.replace("..", "–") : `${opGlyph}${item.value}`;
+    const noMatches = item.matchCount === 0;
+    return (
+      <>
+        <span aria-hidden className={item.negated ? "text-rose-300/90" : "text-sky-400"}>
+          {item.negated ? (
+            <span className="font-mono leading-none">−</span>
+          ) : (
+            <span className="font-mono text-[11px]">≷</span>
+          )}
+        </span>
+        <span className="flex-1 truncate font-mono text-zinc-100">
+          <span className="text-zinc-500">
+            {item.negated ? "Exclude range: " : "Apply range: "}
+          </span>
+          <span>
+            {item.facetKey}:{valueDisplay}
+          </span>
+        </span>
+        <span
+          className={[
+            "ml-2 font-mono text-[11px]",
+            noMatches ? "text-rose-400/80" : "text-sky-300/80",
+          ].join(" ")}
+        >
+          {noMatches
+            ? "no matches"
+            : `${item.matchCount} value${item.matchCount === 1 ? "" : "s"} · ${item.rowCount} row${item.rowCount === 1 ? "" : "s"}`}
+        </span>
+        <ValueActionButtons item={item} facet={facetByKey.get(item.facetKey)} onSelect={onSelect} />
+      </>
+    );
+  }
+
+  if (item.kind === "invalid") {
+    return (
+      <>
+        <span aria-hidden className="text-rose-400/80">
+          <Icon name="info" size="small" />
+        </span>
+        <span className="flex-1 truncate text-rose-200/90">{item.message}</span>
       </>
     );
   }
@@ -285,6 +405,153 @@ function SuggestionRow<T>({
         {relativeTime(item.savedAt)}
       </span>
     </>
+  );
+}
+
+// Always-visible action buttons for a value/pattern/range suggestion:
+//   * `+` — commit as positive (the row body's default if not negated)
+//   * `−` — commit as negated
+//   * `~` — convert this value into a pattern chip, the mouse-only path to
+//     wildcards. Numeric facets get the HTTP-class `<first-digit>*` form
+//     (`500` → `5*`); string facets get `*value*` (contains). Hidden on
+//     enums (where wildcards are redundant) and on rows that already
+//     represent a pattern/range.
+//
+// Pattern research: Kibana Discover hides these behind hover — clean but fails
+// discoverability for users who don't think to mouse over each row. Linear,
+// Notion, and Airtable keep the equivalent operator controls always visible,
+// which trades a small amount of visual weight for a feature that's actually
+// findable. For a dropdown with ≤10 rows per facet, always-visible is right;
+// hover-only would only matter at table-cell density. The buttons are styled
+// muted at rest (low-saturation border + dimmed glyph) and brighten on hover
+// or row hover so they read as auxiliary affordances, not callouts. The button
+// matching the current draft polarity is ring-highlighted so the user can see
+// at a glance which one matches "Enter" / row-body click.
+function ValueActionButtons<T>({
+  item,
+  facet,
+  onSelect,
+}: {
+  item: Suggestion & { negated: boolean };
+  facet: FacetConfig<T> | undefined;
+  onSelect: (item: Suggestion) => void;
+}) {
+  // ~ button only on plain value rows AND non-enum facets — pattern/range
+  // rows already encode a wildcard/range so the mouse path adds nothing.
+  const showPattern =
+    item.kind === "value" && facet !== undefined && facet.type !== "enum";
+  const value = item.kind === "value" ? item.value : "";
+  const pattern =
+    showPattern && facet ? derivePatternFromValue(value, facet.type) : "";
+
+  return (
+    <span className="ml-1 inline-flex items-center gap-0.5">
+      <PolarityButton
+        kind="include"
+        active={!item.negated}
+        onClick={() => onSelect({ ...item, negated: false } as Suggestion)}
+      />
+      <PolarityButton
+        kind="exclude"
+        active={!!item.negated}
+        onClick={() => onSelect({ ...item, negated: true } as Suggestion)}
+      />
+      {showPattern && (
+        <PatternButton
+          pattern={pattern}
+          onClick={() =>
+            onSelect({
+              kind: "pattern",
+              id: `pattern:${item.facetKey}:${pattern}`,
+              facetKey: item.facetKey,
+              pattern,
+              // matchCount/rowCount aren't displayed post-commit; the chip
+              // shows the pattern and the table reflects the actual filter.
+              matchCount: 0,
+              rowCount: 0,
+              negated: false,
+            })
+          }
+        />
+      )}
+    </span>
+  );
+}
+
+// Mouse-only pattern button (`~`). Tooltip shows the resulting pattern
+// before click so the user knows what they'll get without committing.
+function PatternButton({
+  pattern,
+  onClick,
+}: {
+  pattern: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={`Match pattern ${pattern}`}
+      title={`Match pattern: ${pattern}`}
+      tabIndex={-1}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className={[
+        "inline-flex h-5 w-5 items-center justify-center rounded border font-mono text-sm leading-none transition-colors",
+        "border-sky-500/25 text-sky-300/60",
+        "group-hover:border-sky-400/50 group-hover:text-sky-300/90",
+        "hover:!border-sky-400/70 hover:!bg-sky-500/15 hover:!text-sky-100",
+        // Italic to echo the pattern-chip styling on the rail.
+        "italic",
+      ].join(" ")}
+      data-testid={`row-pattern-${pattern}`}
+    >
+      ~
+    </button>
+  );
+}
+
+function PolarityButton({
+  kind,
+  active,
+  onClick,
+}: {
+  kind: "include" | "exclude";
+  active: boolean;
+  onClick: () => void;
+}) {
+  const isInclude = kind === "include";
+  return (
+    <button
+      type="button"
+      aria-label={isInclude ? "Filter for this value" : "Filter out this value"}
+      aria-pressed={active}
+      title={isInclude ? "Include" : "Exclude"}
+      tabIndex={-1}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className={[
+        "inline-flex h-5 w-5 items-center justify-center rounded border font-mono text-sm leading-none transition-colors",
+        // Rest state: visible but muted so the value text stays primary.
+        isInclude
+          ? "border-sky-500/25 text-sky-300/60 group-hover:border-sky-400/50 group-hover:text-sky-300/90 hover:!border-sky-400/70 hover:!bg-sky-500/15 hover:!text-sky-100"
+          : "border-rose-500/25 text-rose-300/60 group-hover:border-rose-400/50 group-hover:text-rose-300/90 hover:!border-rose-400/70 hover:!bg-rose-500/15 hover:!text-rose-100",
+        // Active polarity (the one that matches the typed draft / row default).
+        active && isInclude
+          ? "bg-sky-500/15 text-sky-200 border-sky-400/60 ring-1 ring-inset ring-sky-400/40"
+          : "",
+        active && !isInclude
+          ? "bg-rose-500/15 text-rose-200 border-rose-400/60 ring-1 ring-inset ring-rose-400/40"
+          : "",
+      ].join(" ")}
+    >
+      {isInclude ? "+" : "−"}
+    </button>
   );
 }
 

@@ -14,10 +14,14 @@
     "@mlc-ai/web-llm": "^0.2.82",
     "@speakeasy-api/moonshine": "^0.58.0",
     "autoprefixer": "^10.4.20",
+    "liqe": "^3.8.5",
+    "nuqs": "^2.8.9",
     "postcss": "^8.4.47",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "tailwindcss": "^3.4.14"
+    "react-hotkeys-hook": "^5.2.4",
+    "tailwindcss": "^3.4.14",
+    "usehooks-ts": "^3.1.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",
@@ -30,7 +34,8 @@
     "globals": "^15.11.0",
     "typescript": "~5.6.2",
     "typescript-eslint": "^8.11.0",
-    "vite": "^5.4.10"
+    "vite": "^5.4.10",
+    "vite-node": "^6.0.0"
   },
   "packageManager": "pnpm@9.9.0+sha512.60c18acd138bff695d339be6ad13f7e936eea6745660d4cc4a776d5247c540d0edee1a563695c183a66eb917ef88f2b4feb1fc25f32a7adcadc7aaf3438e99c1"
 }

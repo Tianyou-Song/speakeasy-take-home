@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback } from "react";
+import { useLocalStorage } from "usehooks-ts";
 import { nextTokenId } from "./parse";
-import type { Aggregation, Token } from "./types";
+import type { Aggregation, Op, Token } from "./types";
+
+const VALID_OPS: ReadonlySet<string> = new Set([">", ">=", "<", "<=", ".."]);
 
 export interface SavedView {
   id: string;
@@ -12,6 +15,12 @@ export interface SavedView {
   // Original NL prompt that produced this view, when applicable. Used as the
   // human-readable label in the dropdown and as the default name suggestion.
   nlText?: string;
+  // Advanced-mode source text (cross-facet OR / nested AND-OR / etc that
+  // doesn't flatten to a chip-friendly token list). When present, `tokens`
+  // is empty and the view is restored by re-parsing this text. Saved views
+  // are the only persistence surface that retains advanced queries; recents
+  // store the simple chip form.
+  advancedText?: string;
   savedAt: number;
 }
 
@@ -22,6 +31,7 @@ export interface UseSavedViewsResult {
     tokens: Token[],
     aggregation: Aggregation | null,
     nlText?: string,
+    advancedText?: string,
   ) => void;
   renameView: (id: string, name: string) => void;
   removeView: (id: string) => void;
@@ -30,13 +40,15 @@ export interface UseSavedViewsResult {
 const SAVED_LIMIT = 12;
 
 export function useSavedViews(storageKey: string): UseSavedViewsResult {
-  const [savedViews, setSavedViews] = useState<SavedView[]>(() =>
-    loadSaved(storageKey),
+  const [savedViews, setSavedViews] = useLocalStorage<SavedView[]>(
+    storageKey,
+    [],
+    {
+      serializer: serialiseViews,
+      deserializer: deserialiseViews,
+      initializeWithValue: typeof window !== "undefined",
+    },
   );
-
-  useEffect(() => {
-    saveAll(storageKey, savedViews);
-  }, [storageKey, savedViews]);
 
   const saveView = useCallback(
     (
@@ -44,10 +56,17 @@ export function useSavedViews(storageKey: string): UseSavedViewsResult {
       tokens: Token[],
       aggregation: Aggregation | null,
       nlText?: string,
+      advancedText?: string,
     ) => {
       const trimmed = name.trim();
-      // Allow agg-only saves (no tokens) so NL aggregation queries are saveable.
-      if (!trimmed || (tokens.length === 0 && !aggregation)) return;
+      // Allow agg-only saves (no tokens) AND advanced-text-only saves so NL
+      // aggregations and cross-facet OR queries are both saveable.
+      if (
+        !trimmed ||
+        (tokens.length === 0 && !aggregation && !advancedText)
+      ) {
+        return;
+      }
       setSavedViews((prev) => {
         const dedup = prev.filter((v) => v.name !== trimmed);
         const entry: SavedView = {
@@ -56,34 +75,59 @@ export function useSavedViews(storageKey: string): UseSavedViewsResult {
           tokens: tokens.map((t) => ({ ...t })),
           aggregation: aggregation ? { ...aggregation } : null,
           ...(nlText ? { nlText } : {}),
+          ...(advancedText ? { advancedText } : {}),
           savedAt: Date.now(),
         };
         return [entry, ...dedup].slice(0, SAVED_LIMIT);
       });
     },
-    [],
+    [setSavedViews],
   );
 
-  const renameView = useCallback((id: string, name: string) => {
-    const trimmed = name.trim();
-    if (!trimmed) return;
-    setSavedViews((prev) =>
-      prev.map((v) => (v.id === id ? { ...v, name: trimmed } : v)),
-    );
-  }, []);
+  const renameView = useCallback(
+    (id: string, name: string) => {
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      setSavedViews((prev) =>
+        prev.map((v) => (v.id === id ? { ...v, name: trimmed } : v)),
+      );
+    },
+    [setSavedViews],
+  );
 
-  const removeView = useCallback((id: string) => {
-    setSavedViews((prev) => prev.filter((v) => v.id !== id));
-  }, []);
+  const removeView = useCallback(
+    (id: string) => {
+      setSavedViews((prev) => prev.filter((v) => v.id !== id));
+    },
+    [setSavedViews],
+  );
 
   return { savedViews, saveView, renameView, removeView };
 }
 
-function loadSaved(storageKey: string): SavedView[] {
-  if (typeof window === "undefined") return [];
+// Module-scope so identities are stable across renders — required by
+// useLocalStorage to avoid re-render loops.
+function serialiseViews(views: SavedView[]): string {
+  const minimal = views.map((v) => ({
+    id: v.id,
+    name: v.name,
+    savedAt: v.savedAt,
+    tokens: v.tokens.map(({ facetKey, value, isPattern, negated, op }) => ({
+      facetKey,
+      value,
+      ...(isPattern ? { isPattern: true } : {}),
+      ...(negated ? { negated: true } : {}),
+      ...(op ? { op } : {}),
+    })),
+    aggregation: v.aggregation,
+    ...(v.nlText ? { nlText: v.nlText } : {}),
+    ...(v.advancedText ? { advancedText: v.advancedText } : {}),
+  }));
+  return JSON.stringify(minimal);
+}
+
+function deserialiseViews(raw: string): SavedView[] {
   try {
-    const raw = window.localStorage.getItem(storageKey);
-    if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
     const out: SavedView[] = [];
@@ -98,21 +142,32 @@ function loadSaved(storageKey: string): SavedView[] {
       }
       const tokens = (item.tokens as unknown[])
         .filter(
-          (t): t is { facetKey: string; value: string; isPattern?: boolean } =>
+          (t): t is {
+            facetKey: string;
+            value: string;
+            isPattern?: boolean;
+            negated?: boolean;
+            op?: string;
+          } =>
             !!t &&
             typeof t === "object" &&
             typeof (t as { facetKey?: unknown }).facetKey === "string" &&
             typeof (t as { value?: unknown }).value === "string",
         )
-        .map((t) => ({
-          id: nextTokenId(),
-          facetKey: t.facetKey,
-          value: t.value,
-          ...(t.isPattern ? { isPattern: true } : {}),
-        }));
+        .map((t) => {
+          const tok: Token = { id: nextTokenId(), facetKey: t.facetKey, value: t.value };
+          if (t.isPattern === true) tok.isPattern = true;
+          if (t.negated === true) tok.negated = true;
+          if (typeof t.op === "string" && VALID_OPS.has(t.op)) tok.op = t.op as Op;
+          return tok;
+        });
       const aggregation = parseAggregation(item.aggregation);
-      // Skip only views with neither tokens nor aggregation — empty views are noise.
-      if (tokens.length === 0 && !aggregation) continue;
+      const advancedText =
+        typeof item.advancedText === "string" && item.advancedText.trim().length > 0
+          ? item.advancedText
+          : undefined;
+      // Skip only views with no payload at all — empty views are noise.
+      if (tokens.length === 0 && !aggregation && !advancedText) continue;
       const nlText =
         typeof item.nlText === "string" && item.nlText.trim().length > 0
           ? item.nlText
@@ -126,6 +181,7 @@ function loadSaved(storageKey: string): SavedView[] {
         tokens,
         aggregation,
         ...(nlText ? { nlText } : {}),
+        ...(advancedText ? { advancedText } : {}),
         savedAt:
           typeof item.savedAt === "number" ? item.savedAt : Date.now(),
       });
@@ -133,25 +189,6 @@ function loadSaved(storageKey: string): SavedView[] {
     return out;
   } catch {
     return [];
-  }
-}
-
-function saveAll(storageKey: string, views: SavedView[]): void {
-  if (typeof window === "undefined") return;
-  try {
-    const minimal = views.map((v) => ({
-      id: v.id,
-      name: v.name,
-      savedAt: v.savedAt,
-      tokens: v.tokens.map(({ facetKey, value, isPattern }) =>
-        isPattern ? { facetKey, value, isPattern } : { facetKey, value },
-      ),
-      aggregation: v.aggregation,
-      ...(v.nlText ? { nlText: v.nlText } : {}),
-    }));
-    window.localStorage.setItem(storageKey, JSON.stringify(minimal));
-  } catch {
-    // localStorage may be disabled
   }
 }
 

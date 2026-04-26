@@ -1,18 +1,24 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
+import { useLocalStorage } from "usehooks-ts";
 import { topNBy } from "./aggregate";
 import { fuzzyMatch } from "./match";
-import { nextTokenId, parseDraft } from "./parse";
-import { compilePatternRegex, filterRows, uniqueValuesForFacet } from "./filter";
+import { nextTokenId, parseDraft, parseQuery, parseValuePart } from "./parse";
+import { compilePatternRegex, filterRows, matchTokenValue, uniqueValuesForFacet } from "./filter";
 import {
   aggregationSummary,
   canonicalQueryKey,
+  EMPTY_QUERY,
   isPatternFacet,
   isPatternValue,
+  serialiseToken,
   serialiseTokens,
+  tokensOf,
   type Aggregation,
   type Draft,
   type FacetConfig,
   type MatchedSuggestion,
+  type Op,
+  type Query,
   type Token,
   type TopNRow,
 } from "./types";
@@ -32,6 +38,7 @@ export type Suggestion =
       facetKey: string;
       value: string;
       count: number;
+      negated: boolean;
       match?: MatchedSuggestion;
     }
   | {
@@ -41,6 +48,23 @@ export type Suggestion =
       pattern: string;
       matchCount: number;
       rowCount: number;
+      negated: boolean;
+    }
+  | {
+      kind: "range";
+      id: string;
+      facetKey: string;
+      op: Op;
+      value: string;
+      matchCount: number;
+      rowCount: number;
+      negated: boolean;
+    }
+  | {
+      kind: "invalid";
+      id: string;
+      reason: "non-numeric-op" | "bad-range";
+      message: string;
     }
   | {
       kind: "recent";
@@ -59,6 +83,9 @@ export type Suggestion =
       // Full state to restore when this suggestion is committed.
       aggregation: Aggregation | null;
       nlText?: string;
+      // Raw advanced-mode source. When present, restore re-parses this and
+      // switches the query to advanced mode; tokens is empty for these views.
+      advancedText?: string;
       label: string;
     };
 
@@ -91,7 +118,16 @@ export interface ApplyNLArgs {
   nlText?: string;
 }
 
+// Sentinel chip id for the advanced-mode pseudo-chip. Lives in the same id
+// space as real token ids so the chip rail can key/uniqueId the rendered
+// chip without a separate code path.
+export const ADVANCED_CHIP_ID = "_advanced";
+
 export interface UseFacetSearchResult<T> {
+  query: Query;
+  // Derived from query: simple → its tokens, advanced → []. Kept as a
+  // first-class field so existing consumers (chip rendering, URL sync)
+  // don't need to know about the union type.
   tokens: Token[];
   inputValue: string;
   setInputValue: (next: string) => void;
@@ -102,6 +138,12 @@ export interface UseFacetSearchResult<T> {
   facetByKey: Map<string, FacetConfig<T>>;
   commitAt: (index: number) => void;
   commit: (s: Suggestion) => void;
+  // Parses the current input — or the explicit `textOverride` — as a whole
+  // query (the liqe-backed entry path for AND/OR/NOT/parens/brackets/quotes).
+  // Returns true on a successful commit (input is consumed and cleared when
+  // textOverride is omitted); false if the parse produced no useful query,
+  // so the caller can fall through to NL or other handling.
+  commitDraft: (textOverride?: string) => boolean;
   removeToken: (id: string) => void;
   removeTokensByIds: (ids: string[]) => void;
   applyTokens: (tokens: Token[], nlText?: string) => void;
@@ -118,8 +160,10 @@ export interface UseFacetSearchResult<T> {
 }
 
 const RECENTS_LIMIT = 6;
-// v3: RecentEntry gained optional `nlText`. v1/v2 still loadable.
-const DEFAULT_STORAGE_KEY = "facet-search:recents:v3";
+// v4: RecentEntry gained optional advanced-mode `text` for queries that
+// don't flatten to a flat AND of facet predicates. v1/v2/v3 still loadable
+// via the legacy paths in deserialiseRecents.
+const DEFAULT_STORAGE_KEY = "facet-search:recents:v4";
 
 const byMatchScoreDesc = (a: Suggestion, b: Suggestion): number => {
   const sa = "match" in a && a.match ? a.match.score : 0;
@@ -133,14 +177,18 @@ export function useFacetSearch<T>({
   storageKey = DEFAULT_STORAGE_KEY,
   savedViews = [],
 }: UseFacetSearchArgs<T>): UseFacetSearchResult<T> {
-  const [tokens, setTokens] = useState<Token[]>([]);
+  const [query, setQuery] = useState<Query>(EMPTY_QUERY);
   const [inputValue, setInputValueRaw] = useState("");
   const [aggregation, setAggregationRaw] = useState<Aggregation | null>(null);
-  const [recents, setRecents] = useState<RecentEntry[]>(() => loadRecents(storageKey));
+  const [recents, setRecents] = useLocalStorage<RecentEntry[]>(storageKey, [], {
+    serializer: serialiseRecents,
+    deserializer: deserialiseRecents,
+    initializeWithValue: typeof window !== "undefined",
+  });
 
-  useEffect(() => {
-    saveRecents(storageKey, recents);
-  }, [recents, storageKey]);
+  // Derived: simple-mode chip list. Empty in advanced mode (the advanced
+  // chip is rendered separately by the chip rail).
+  const tokens = useMemo(() => tokensOf(query), [query]);
 
   const draft = useMemo(() => parseDraft(inputValue, facets), [inputValue, facets]);
 
@@ -150,8 +198,8 @@ export function useFacetSearch<T>({
   );
 
   const filteredRows = useMemo(
-    () => filterRows(rows, tokens, facetByKey),
-    [rows, tokens, facetByKey],
+    () => filterRows(rows, query, facetByKey, facets),
+    [rows, query, facetByKey, facets],
   );
 
   const topN = useMemo<TopNRow[] | null>(() => {
@@ -205,6 +253,7 @@ export function useFacetSearch<T>({
             tokens: view.tokens,
             aggregation: view.aggregation ?? null,
             ...(view.nlText ? { nlText: view.nlText } : {}),
+            ...(view.advancedText ? { advancedText: view.advancedText } : {}),
             label: savedViewLabel(view, facetByKey),
           })),
         });
@@ -230,47 +279,102 @@ export function useFacetSearch<T>({
         const all = uniquesByFacet.get(draft.facetKey) ?? [];
         const items: Suggestion[] = [];
         const partial = draft.partial;
-        const wildcardActive = isPatternValue(partial) && isPatternFacet(facet);
+        const negated = draft.negated;
+        const parsed = parseValuePart(partial, facet.type);
 
-        if (wildcardActive) {
-          const re = compilePatternRegex(partial);
+        if (parsed.invalid === "non-numeric-op") {
+          items.push({
+            kind: "invalid",
+            id: `invalid:${facet.key}:non-numeric-op`,
+            reason: "non-numeric-op",
+            message: `Range and comparison filters apply only to numeric facets — ${facet.label} is ${facet.type}.`,
+          });
+        } else if (parsed.invalid === "bad-range") {
+          items.push({
+            kind: "invalid",
+            id: `invalid:${facet.key}:bad-range`,
+            reason: "bad-range",
+            message: "Range start must be less than or equal to range end.",
+          });
+        } else if (parsed.op && parsed.value) {
+          // Build a single committable range/comparator row. Counts are
+          // computed against the full distinct-value set (matches existing
+          // pattern-row semantics for consistency).
+          const probe: Token = {
+            id: "_probe",
+            facetKey: facet.key,
+            value: parsed.value,
+            op: parsed.op,
+          };
           let matchCount = 0;
           let rowCount = 0;
           for (const { value, count } of all) {
-            if (re.test(value)) {
+            if (matchTokenValue(probe, value)) {
               matchCount += 1;
               rowCount += count;
             }
           }
-          items.push({
-            kind: "pattern",
-            id: `pattern:${facet.key}:${partial}`,
-            facetKey: facet.key,
-            pattern: partial,
-            matchCount,
-            rowCount,
-          });
+          if (matchCount > 0) {
+            items.push({
+              kind: "range",
+              id: `range:${facet.key}:${parsed.op}:${parsed.value}`,
+              facetKey: facet.key,
+              op: parsed.op,
+              value: parsed.value,
+              matchCount,
+              rowCount,
+              negated: negated || parsed.inlineNegated,
+            });
+          }
+        } else {
+          // Plain value typing — wildcard or equality pick from the value list.
+          const effectiveNegated = negated || parsed.inlineNegated;
+          const wildcardActive = isPatternValue(parsed.value) && isPatternFacet(facet);
+
+          if (wildcardActive) {
+            const re = compilePatternRegex(parsed.value);
+            let matchCount = 0;
+            let rowCount = 0;
+            for (const { value, count } of all) {
+              if (re.test(value)) {
+                matchCount += 1;
+                rowCount += count;
+              }
+            }
+            items.push({
+              kind: "pattern",
+              id: `pattern:${facet.key}:${parsed.value}`,
+              facetKey: facet.key,
+              pattern: parsed.value,
+              matchCount,
+              rowCount,
+              negated: effectiveNegated,
+            });
+          }
+
+          const valueQuery = parsed.value;
+          for (const { value, count } of all) {
+            const m = valueQuery ? fuzzyMatch(valueQuery, value) : { score: 0, ranges: [] };
+            if (m == null) continue;
+            items.push({
+              kind: "value",
+              id: `value:${facet.key}:${value}`,
+              facetKey: facet.key,
+              value,
+              count,
+              negated: effectiveNegated,
+              match: valueQuery ? { key: value, score: m.score, ranges: m.ranges } : undefined,
+            });
+          }
+          if (valueQuery && !wildcardActive) items.sort(byMatchScoreDesc);
+          else if (valueQuery && wildcardActive) {
+            const [first, ...rest] = items;
+            rest.sort(byMatchScoreDesc);
+            items.length = 0;
+            items.push(first, ...rest);
+          }
         }
 
-        for (const { value, count } of all) {
-          const m = partial ? fuzzyMatch(partial, value) : { score: 0, ranges: [] };
-          if (m == null) continue;
-          items.push({
-            kind: "value",
-            id: `value:${facet.key}:${value}`,
-            facetKey: facet.key,
-            value,
-            count,
-            match: partial ? { key: value, score: m.score, ranges: m.ranges } : undefined,
-          });
-        }
-        if (partial && !wildcardActive) items.sort(byMatchScoreDesc);
-        else if (partial && wildcardActive) {
-          const [first, ...rest] = items;
-          rest.sort(byMatchScoreDesc);
-          items.length = 0;
-          items.push(first, ...rest);
-        }
         out.push({
           id: `values:${facet.key}`,
           heading: `${facet.label} values`,
@@ -285,15 +389,24 @@ export function useFacetSearch<T>({
   // Identifies whether the current full query state (tokens + aggregation)
   // exactly matches a saved view (order-independent). The single source of
   // truth for the star button's saved/unsaved visual state.
+  //
+  // Advanced-mode queries match by canonical text (an exact-string compare):
+  // the AST has structural variation (parens, whitespace) that legitimately
+  // distinguishes user intent, so we don't try to canonicalise across them.
   const matchedSavedView = useMemo<SavedView | null>(() => {
+    if (query.mode === "advanced") {
+      return savedViews.find((v) => v.advancedText === query.text) ?? null;
+    }
     if (tokens.length === 0 && aggregation === null) return null;
     const key = canonicalQueryKey(tokens, aggregation);
     return (
       savedViews.find(
-        (v) => canonicalQueryKey(v.tokens, v.aggregation ?? null) === key,
+        (v) =>
+          !v.advancedText &&
+          canonicalQueryKey(v.tokens, v.aggregation ?? null) === key,
       ) ?? null
     );
-  }, [tokens, aggregation, savedViews]);
+  }, [query, tokens, aggregation, savedViews]);
 
   const itemCount = useMemo(
     () => sections.reduce((acc, s) => acc + s.items.length, 0),
@@ -302,35 +415,84 @@ export function useFacetSearch<T>({
 
   const setInputValue = useCallback((next: string) => setInputValueRaw(next), []);
 
+  // Append a single new token to a simple-mode query. In advanced mode the
+  // dropdown shouldn't be offering chip-add suggestions (the input is empty
+  // until the user edits the advanced chip), so we no-op rather than
+  // destroy the user's typed query.
+  const appendToken = useCallback((tok: Token) => {
+    setQuery((prev) => {
+      if (prev.mode === "advanced") return prev;
+      return { mode: "simple", tokens: [...prev.tokens, tok] };
+    });
+    setInputValueRaw("");
+  }, []);
+
   const commit = useCallback((s: Suggestion) => {
     if (s.kind === "facet") {
       setInputValueRaw(`${s.facetKey}:`);
       return;
     }
     if (s.kind === "value") {
-      setTokens((prev) => [...prev, { id: nextTokenId(), facetKey: s.facetKey, value: s.value }]);
-      setInputValueRaw("");
+      const tok: Token = { id: nextTokenId(), facetKey: s.facetKey, value: s.value };
+      if (s.negated) tok.negated = true;
+      appendToken(tok);
       return;
     }
     if (s.kind === "pattern") {
-      setTokens((prev) => [
-        ...prev,
-        { id: nextTokenId(), facetKey: s.facetKey, value: s.pattern, isPattern: true },
-      ]);
-      setInputValueRaw("");
+      const tok: Token = {
+        id: nextTokenId(),
+        facetKey: s.facetKey,
+        value: s.pattern,
+        isPattern: true,
+      };
+      if (s.negated) tok.negated = true;
+      appendToken(tok);
+      return;
+    }
+    if (s.kind === "range") {
+      const tok: Token = {
+        id: nextTokenId(),
+        facetKey: s.facetKey,
+        value: s.value,
+        op: s.op,
+      };
+      if (s.negated) tok.negated = true;
+      appendToken(tok);
+      return;
+    }
+    if (s.kind === "invalid") {
+      // Non-committable feedback row — no-op.
       return;
     }
     if (s.kind === "saved") {
-      // Restore the full query state — tokens AND aggregation.
-      setTokens(s.tokens.map((t) => ({ ...t, id: nextTokenId() })));
+      // Restore the full query state — tokens/advanced AND aggregation.
+      // Advanced views re-parse the raw text via parseQuery so the AST is
+      // rebuilt; if the parse fails (schema drift), fall back to an empty
+      // simple query rather than silently corrupting state.
+      if (s.advancedText) {
+        const result = parseQuery(s.advancedText, facets);
+        if (result.query) {
+          setQuery(result.query);
+        } else {
+          setQuery(EMPTY_QUERY);
+        }
+      } else {
+        setQuery({
+          mode: "simple",
+          tokens: s.tokens.map((t) => ({ ...t, id: nextTokenId() })),
+        });
+      }
       setAggregationRaw(s.aggregation);
       setInputValueRaw("");
       return;
     }
     // recent — replace tokens; recents don't carry aggregation.
-    setTokens(s.tokens.map((t) => ({ ...t, id: nextTokenId() })));
+    setQuery({
+      mode: "simple",
+      tokens: s.tokens.map((t) => ({ ...t, id: nextTokenId() })),
+    });
     setInputValueRaw("");
-  }, []);
+  }, [appendToken]);
 
   const commitAt = useCallback(
     (index: number) => {
@@ -346,21 +508,88 @@ export function useFacetSearch<T>({
     [sections, commit],
   );
 
+  // Liqe-backed entry path: parse the input (or `textOverride`) as a Datadog
+  // query. Returns true when the parse produced a non-empty Query and the
+  // input was consumed; false on parse failure or empty result, so the
+  // caller can fall through to NL or other handling.
+  //
+  // `textOverride` is for non-input-bound entry points like URL load — when
+  // provided, the inputValue is left alone (typed-commit clears it).
+  //
+  // Merge rules (only the typed-commit path follows these — suggestion /
+  // saved / recent / NL paths have their own semantics):
+  //   * existing simple + parsed simple → append tokens (back-compat with
+  //     today's per-chunk add)
+  //   * existing simple + parsed advanced → switch to advanced mode
+  //   * existing advanced + parsed * → no-op; user must edit the advanced
+  //     chip first to come back to simple-mode-empty
+  const commitDraft = useCallback((textOverride?: string): boolean => {
+    const text = (textOverride ?? inputValue).trim();
+    if (!text) return false;
+    const result = parseQuery(text, facets);
+    if (!result.query) return false;
+    const parsed = result.query;
+    if (parsed.mode === "simple" && parsed.tokens.length === 0) return false;
+
+    // Decide synchronously from the closure-captured `query`. The setQuery
+    // updater itself does the merge; mutating a flag inside the updater
+    // isn't safe since StrictMode invokes it twice in dev (and the timing
+    // of the second invocation relative to the post-call statement here
+    // makes flag-based control flow racy).
+    if (query.mode === "advanced") return false;
+
+    setQuery((prev) => {
+      if (prev.mode === "advanced") return prev;
+      if (parsed.mode === "advanced") return parsed;
+      return {
+        mode: "simple",
+        tokens: [
+          ...prev.tokens,
+          ...parsed.tokens.map((t) => ({ ...t, id: nextTokenId() })),
+        ],
+      };
+    });
+    if (textOverride === undefined) setInputValueRaw("");
+    return true;
+  }, [query, inputValue, facets]);
+
   const removeToken = useCallback((id: string) => {
-    setTokens((prev) => prev.filter((t) => t.id !== id));
+    setQuery((prev) => {
+      if (prev.mode === "advanced") {
+        if (id === ADVANCED_CHIP_ID) return EMPTY_QUERY;
+        return prev;
+      }
+      return {
+        mode: "simple",
+        tokens: prev.tokens.filter((t) => t.id !== id),
+      };
+    });
   }, []);
 
   const removeTokensByIds = useCallback((ids: string[]) => {
     if (ids.length === 0) return;
     const idSet = new Set(ids);
-    setTokens((prev) => prev.filter((t) => !idSet.has(t.id)));
+    setQuery((prev) => {
+      if (prev.mode === "advanced") return prev;
+      return {
+        mode: "simple",
+        tokens: prev.tokens.filter((t) => !idSet.has(t.id)),
+      };
+    });
   }, []);
 
   const applyTokens = useCallback(
     (newTokens: Token[], nlText?: string) => {
       if (newTokens.length === 0) return;
       const stamped = newTokens.map((t) => ({ ...t, id: t.id || nextTokenId() }));
-      setTokens((prev) => [...prev, ...stamped]);
+      // NL / saved / recent paths always coalesce into simple mode. If the
+      // user was in advanced mode, this resets to a fresh simple chip set —
+      // matching how each of these entry points conceptually starts over.
+      setQuery((prev) =>
+        prev.mode === "simple"
+          ? { mode: "simple", tokens: [...prev.tokens, ...stamped] }
+          : { mode: "simple", tokens: stamped },
+      );
       setInputValueRaw("");
       // Record this as a recent so users can re-run the same NL query later.
       setRecents((prev) => {
@@ -376,7 +605,7 @@ export function useFacetSearch<T>({
         return [entry, ...dedup].slice(0, RECENTS_LIMIT);
       });
     },
-    [],
+    [setRecents],
   );
 
   const setAggregation = useCallback((a: Aggregation | null) => {
@@ -386,12 +615,18 @@ export function useFacetSearch<T>({
   const applyNLResult = useCallback(
     ({ tokens: newTokens, aggregation: newAgg, nlText }: ApplyNLArgs) => {
       // Stamp new token ids and apply atomically with the aggregation so the
-      // table doesn't paint twice.
+      // table doesn't paint twice. NL always settles into simple mode.
       const stamped = newTokens.map((t) => ({
         ...t,
         id: t.id || nextTokenId(),
       }));
-      if (stamped.length > 0) setTokens((prev) => [...prev, ...stamped]);
+      if (stamped.length > 0) {
+        setQuery((prev) =>
+          prev.mode === "simple"
+            ? { mode: "simple", tokens: [...prev.tokens, ...stamped] }
+            : { mode: "simple", tokens: stamped },
+        );
+      }
       setAggregationRaw(newAgg);
       setInputValueRaw("");
       // Recents only when there's something to record (either new tokens or
@@ -410,48 +645,68 @@ export function useFacetSearch<T>({
         return [entry, ...dedup].slice(0, RECENTS_LIMIT);
       });
     },
-    [],
+    [setRecents],
   );
 
   const editLastToken = useCallback(() => {
-    setTokens((prev) => {
-      if (prev.length === 0) return prev;
-      const last = prev[prev.length - 1];
-      setInputValueRaw(`${last.facetKey}:${last.value}`);
-      return prev.slice(0, -1);
+    setQuery((prev) => {
+      if (prev.mode === "advanced") {
+        // Whole-query edit: text back into input, clear query so subsequent
+        // typing / Enter follows the simple-empty path.
+        setInputValueRaw(prev.text);
+        return EMPTY_QUERY;
+      }
+      if (prev.tokens.length === 0) return prev;
+      const last = prev.tokens[prev.tokens.length - 1];
+      setInputValueRaw(serialiseToken(last));
+      return { mode: "simple", tokens: prev.tokens.slice(0, -1) };
     });
   }, []);
 
   const editToken = useCallback((id: string) => {
-    setTokens((prev) => {
-      const idx = prev.findIndex((t) => t.id === id);
+    setQuery((prev) => {
+      if (prev.mode === "advanced") {
+        if (id !== ADVANCED_CHIP_ID) return prev;
+        setInputValueRaw(prev.text);
+        return EMPTY_QUERY;
+      }
+      const idx = prev.tokens.findIndex((t) => t.id === id);
       if (idx === -1) return prev;
-      const tok = prev[idx];
-      setInputValueRaw(`${tok.facetKey}:${tok.value}`);
-      return [...prev.slice(0, idx), ...prev.slice(idx + 1)];
+      setInputValueRaw(serialiseToken(prev.tokens[idx]));
+      return {
+        mode: "simple",
+        tokens: [...prev.tokens.slice(0, idx), ...prev.tokens.slice(idx + 1)],
+      };
     });
   }, []);
 
   const clearAll = useCallback(() => {
-    setTokens([]);
+    setQuery(EMPTY_QUERY);
     setInputValueRaw("");
     setAggregationRaw(null);
   }, []);
 
   const saveCurrentAsRecent = useCallback(() => {
     setRecents((prev) => {
-      if (tokens.length === 0) return prev;
-      const serial = serialiseTokens(tokens);
+      // Recents only stores simple-mode chip lists today. Advanced-mode
+      // saved views are the right home for advanced queries (saveable by
+      // name); we don't auto-snapshot advanced text into recents to keep
+      // the recents list focused on the chip-friendly form.
+      if (query.mode === "advanced") return prev;
+      const tokenList = query.tokens;
+      if (tokenList.length === 0) return prev;
+      const serial = serialiseTokens(tokenList);
       const dedup = prev.filter((r) => serialiseTokens(r.tokens) !== serial);
       const entry: RecentEntry = {
-        tokens: tokens.map((t) => ({ ...t })),
+        tokens: tokenList.map((t) => ({ ...t })),
         savedAt: Date.now(),
       };
       return [entry, ...dedup].slice(0, RECENTS_LIMIT);
     });
-  }, [tokens]);
+  }, [query, setRecents]);
 
   return {
+    query,
     tokens,
     inputValue,
     setInputValue,
@@ -462,6 +717,7 @@ export function useFacetSearch<T>({
     facetByKey,
     commitAt,
     commit,
+    commitDraft,
     removeToken,
     removeTokensByIds,
     applyTokens,
@@ -480,14 +736,16 @@ export function useFacetSearch<T>({
 
 // Secondary label for a saved-view dropdown row. Priority:
 //   1. nlText (the original NL prompt) — preserves intent for AI searches
-//   2. tokens + " · " + agg summary — for hybrid views
-//   3. tokens alone — classic filter views
-//   4. agg summary alone — agg-only views
+//   2. advancedText (raw cross-facet OR / nested AND-OR query)
+//   3. tokens + " · " + agg summary — for hybrid views
+//   4. tokens alone — classic filter views
+//   5. agg summary alone — agg-only views
 function savedViewLabel<T>(
   view: SavedView,
   facetByKey: Map<string, FacetConfig<T>>,
 ): string {
   if (view.nlText) return view.nlText;
+  if (view.advancedText) return view.advancedText;
   const tokenPart = view.tokens.length > 0 ? serialiseTokens(view.tokens) : "";
   const aggPart = view.aggregation
     ? aggregationSummary(
@@ -499,11 +757,27 @@ function savedViewLabel<T>(
   return tokenPart || aggPart;
 }
 
-function loadRecents(storageKey: string): RecentEntry[] {
-  if (typeof window === "undefined") return [];
+const VALID_OPS: ReadonlySet<string> = new Set([">", ">=", "<", "<=", ".."]);
+
+// Module-scope so identities are stable across renders — required by
+// useLocalStorage to avoid re-render loops.
+function serialiseRecents(recents: RecentEntry[]): string {
+  const minimal = recents.map((entry) => ({
+    tokens: entry.tokens.map(({ facetKey, value, isPattern, negated, op }) => ({
+      facetKey,
+      value,
+      ...(isPattern ? { isPattern: true } : {}),
+      ...(negated ? { negated: true } : {}),
+      ...(op ? { op } : {}),
+    })),
+    savedAt: entry.savedAt,
+    ...(entry.nlText ? { nlText: entry.nlText } : {}),
+  }));
+  return JSON.stringify(minimal);
+}
+
+function deserialiseRecents(raw: string): RecentEntry[] {
   try {
-    const raw = window.localStorage.getItem(storageKey);
-    if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
 
@@ -518,18 +792,25 @@ function loadRecents(storageKey: string): RecentEntry[] {
           : [];
       const tokens = rawTokens
         .filter(
-          (t): t is { facetKey: string; value: string; isPattern?: boolean } =>
+          (t): t is {
+            facetKey: string;
+            value: string;
+            isPattern?: boolean;
+            negated?: boolean;
+            op?: string;
+          } =>
             !!t &&
             typeof t === "object" &&
             typeof (t as { facetKey?: unknown }).facetKey === "string" &&
             typeof (t as { value?: unknown }).value === "string",
         )
-        .map((t) => ({
-          id: nextTokenId(),
-          facetKey: t.facetKey,
-          value: t.value,
-          ...(t.isPattern ? { isPattern: true } : {}),
-        }));
+        .map((t) => {
+          const tok: Token = { id: nextTokenId(), facetKey: t.facetKey, value: t.value };
+          if (t.isPattern === true) tok.isPattern = true;
+          if (t.negated === true) tok.negated = true;
+          if (typeof t.op === "string" && VALID_OPS.has(t.op)) tok.op = t.op as Op;
+          return tok;
+        });
       if (tokens.length === 0) continue;
       const savedAt =
         !isLegacy && typeof item?.savedAt === "number"
@@ -544,21 +825,5 @@ function loadRecents(storageKey: string): RecentEntry[] {
     return out;
   } catch {
     return [];
-  }
-}
-
-function saveRecents(storageKey: string, recents: RecentEntry[]): void {
-  if (typeof window === "undefined") return;
-  try {
-    const minimal = recents.map((entry) => ({
-      tokens: entry.tokens.map(({ facetKey, value, isPattern }) =>
-        isPattern ? { facetKey, value, isPattern } : { facetKey, value },
-      ),
-      savedAt: entry.savedAt,
-      ...(entry.nlText ? { nlText: entry.nlText } : {}),
-    }));
-    window.localStorage.setItem(storageKey, JSON.stringify(minimal));
-  } catch {
-    // localStorage may be disabled (private mode)
   }
 }

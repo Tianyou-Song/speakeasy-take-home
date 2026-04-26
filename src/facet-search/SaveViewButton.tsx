@@ -19,6 +19,11 @@ interface SaveViewButtonProps {
   tokens: Token[];
   aggregation: Aggregation | null;
   nlText?: string;
+  // Raw text of an advanced-mode query (cross-facet OR / nested AND-OR).
+  // When present, takes priority over `tokens` for the dialog's name
+  // suggestion and the "what's saved" preview, so users see the same form
+  // on the chip rail and in the save dialog.
+  advancedText?: string;
   matched: SavedView | null;
   onSave: (name: string) => void;
   onRename: (id: string, name: string) => void;
@@ -30,6 +35,7 @@ export function SaveViewButton({
   tokens,
   aggregation,
   nlText,
+  advancedText,
   matched,
   onSave,
   onRename,
@@ -121,7 +127,7 @@ export function SaveViewButton({
               ) : (
                 <SavePane
                   labelId={labelId}
-                  defaultName={defaultName(tokens, aggregation, nlText)}
+                  defaultName={defaultName(tokens, aggregation, nlText, advancedText)}
                   onSave={(name) => {
                     onSave(name);
                     close();
@@ -328,9 +334,14 @@ function defaultName(
   tokens: Token[],
   aggregation: Aggregation | null,
   nlText?: string,
+  advancedText?: string,
 ): string {
   if (nlText && nlText.trim().length > 0) {
     const trimmed = nlText.trim();
+    return trimmed.length > 60 ? `${trimmed.slice(0, 57)}…` : trimmed;
+  }
+  if (advancedText && advancedText.trim().length > 0) {
+    const trimmed = advancedText.trim();
     return trimmed.length > 60 ? `${trimmed.slice(0, 57)}…` : trimmed;
   }
   if (tokens.length > 0) {

@@ -1,17 +1,26 @@
 import { Icon } from "@speakeasy-api/moonshine";
-import type { MouseEventHandler } from "react";
+import type { KeyboardEventHandler, MouseEventHandler, Ref } from "react";
 import type { Aggregation, FacetConfig } from "./types";
 
 interface AggregationChipProps<T> {
   aggregation: Aggregation;
   facet: FacetConfig<T> | undefined;
   onRemove: () => void;
+  // Roving-focus props (parity with FacetChip).
+  isFocused?: boolean;
+  tabIndex?: number;
+  onKeyDown?: KeyboardEventHandler<HTMLDivElement>;
+  chipRef?: Ref<HTMLDivElement>;
 }
 
 export function AggregationChip<T>({
   aggregation,
   facet,
   onRemove,
+  isFocused,
+  tabIndex,
+  onKeyDown,
+  chipRef,
 }: AggregationChipProps<T>) {
   const handleRemove: MouseEventHandler = (e) => {
     e.stopPropagation();
@@ -20,15 +29,23 @@ export function AggregationChip<T>({
   const groupLabel = facet?.label ?? aggregation.groupBy;
   const direction = aggregation.orderBy === "count_asc" ? "least" : "top";
   const limitLabel = aggregation.limit === 1 ? "" : `${aggregation.limit} `;
+  const ariaLabel = `${direction === "top" ? "Top" : "Least"} ${aggregation.limit} by ${groupLabel}`;
   return (
-    <span
+    <div
+      ref={chipRef}
+      role="button"
+      tabIndex={tabIndex ?? -1}
+      aria-pressed={isFocused ? true : undefined}
+      aria-label={ariaLabel}
       className={[
         "group inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5",
-        "text-xs font-medium leading-5 select-none transition-colors shrink-0",
+        "text-xs font-medium leading-5 cursor-pointer select-none transition-colors shrink-0",
         "border-violet-400/40 bg-violet-500/10 text-violet-100 hover:bg-violet-500/15",
+        "outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 focus-visible:ring-offset-1 focus-visible:ring-offset-zinc-950",
       ].join(" ")}
       onMouseDown={(e) => e.preventDefault()}
-      title={`${direction === "top" ? "Top" : "Least"} ${aggregation.limit} by ${groupLabel} (count) — click × to remove`}
+      onKeyDown={onKeyDown}
+      title={`${ariaLabel} (count) — click × or press Backspace to remove`}
       data-testid={`aggregation-chip-${aggregation.groupBy}`}
     >
       <span aria-hidden className="text-violet-300">
@@ -50,7 +67,7 @@ export function AggregationChip<T>({
       >
         <Icon name="x" size="small" />
       </button>
-    </span>
+    </div>
   );
 }
 

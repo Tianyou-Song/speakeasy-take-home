@@ -1,4 +1,4 @@
-import type { Aggregation, Token } from "../types";
+import type { Aggregation, Op, Token } from "../types";
 import type {
   NLEngine,
   NLEngineStatus,
@@ -74,7 +74,7 @@ Available facets (the only valid facetKey values):
 Output schema (return ONLY this JSON object — no commentary, no markdown fences, no explanations):
 {
   "intent": "filter" | "analytical",
-  "tokens": [ { "facetKey": "method"|"status"|"domain"|"path", "value": "...", "isPattern": true|false } ],
+  "tokens": [ { "facetKey": "method"|"status"|"domain"|"path", "value": "...", "isPattern": true|false, "negated"?: true|false, "op"?: ">"|">="|"<"|"<="|".." } ],
   "aggregation": null | {
     "groupBy": "method"|"status"|"domain"|"path",
     "aggregator": "count",
@@ -97,6 +97,20 @@ Filter rules (apply to the tokens array):
 - "success" / "successful" / "ok" / "200s" -> { "facetKey": "status", "value": "2*", "isPattern": true }
 - "redirects" / "3xx" -> { "facetKey": "status", "value": "3*", "isPattern": true }
 - Path keywords (auth, login, payment, admin, health, dashboard, webhook, sdk, user, metric, blog, doc) -> { "facetKey": "path", "value": "*<keyword>*", "isPattern": true }
+
+Negation and range rules (apply to filter tokens):
+- "negated": true when the user explicitly excludes a value with words like "not", "except", "excluding", "without", "no", "anything but", "other than".
+  Example: "not 5xx" -> { "facetKey": "status", "value": "5*", "isPattern": true, "negated": true }
+- "op" is set on numeric facets (only "status") for comparison phrases:
+  - "above" / "over" / "more than" / "greater than"  -> ">"
+  - "at least" / ">=" / "or more"                    -> ">="
+  - "below" / "under" / "less than"                  -> "<"
+  - "at most" / "<=" / "or less"                     -> "<="
+  - "between X and Y" / "X to Y" / "X..Y"            -> ".." with value "X..Y"
+- When "op" is set, "isPattern" is false and "value" is the numeric string ("400") or the "lo..hi" form for "..".
+- Set "op" ONLY on "status" — never on method/domain/path.
+- A token cannot have both "isPattern": true and a non-empty "op". Pick one.
+- "negated" can combine with "op" or "isPattern" — e.g. "everything except between 200 and 299" -> negated:true, op:"..", value:"200..299".
 
 Intent + aggregation rules:
 - intent is "analytical" when the query asks "which", "top N", "most", "least", "highest", "lowest", "rank", "by frequency", "ratio", or otherwise wants a grouped/ranked answer.
@@ -142,6 +156,30 @@ const FEW_SHOT: ReadonlyArray<{ user: string; assistant: string }> = [
     user: "most frequent http verb on api.speakeasy.com",
     assistant: `{"intent":"analytical","tokens":[{"facetKey":"domain","value":"api.speakeasy.com","isPattern":false}],"aggregation":{"groupBy":"method","aggregator":"count","orderBy":"count_desc","limit":1}}`,
   },
+  {
+    user: "everything except 5xx",
+    assistant: `{"intent":"filter","tokens":[{"facetKey":"status","value":"5*","isPattern":true,"negated":true}],"aggregation":null}`,
+  },
+  {
+    user: "status above 400",
+    assistant: `{"intent":"filter","tokens":[{"facetKey":"status","value":"400","isPattern":false,"op":">"}],"aggregation":null}`,
+  },
+  {
+    user: "status between 200 and 299",
+    assistant: `{"intent":"filter","tokens":[{"facetKey":"status","value":"200..299","isPattern":false,"op":".."}],"aggregation":null}`,
+  },
+  {
+    user: "GET requests not to auth",
+    assistant: `{"intent":"filter","tokens":[{"facetKey":"method","value":"GET","isPattern":false},{"facetKey":"path","value":"*auth*","isPattern":true,"negated":true}],"aggregation":null}`,
+  },
+  {
+    // Explicit union phrasing — same-facet OR. The model produces two
+    // domain tokens, which the chip rail renders with an inline "or"
+    // connector and the simple-mode evaluator OR's together within the
+    // facet. Reduces variance vs. relying on training prior alone.
+    user: "requests to speakeasy or openai",
+    assistant: `{"intent":"filter","tokens":[{"facetKey":"domain","value":"*speakeasy*","isPattern":true},{"facetKey":"domain","value":"*openai*","isPattern":true}],"aggregation":null}`,
+  },
 ];
 
 type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
@@ -150,7 +188,11 @@ interface RawToken {
   facetKey?: unknown;
   value?: unknown;
   isPattern?: unknown;
+  negated?: unknown;
+  op?: unknown;
 }
+
+const VALID_OPS: ReadonlySet<string> = new Set([">", ">=", "<", "<=", ".."]);
 
 interface MLCEngineLike {
   chat: {
@@ -287,26 +329,44 @@ function validateTokens(parsed: unknown, facets: NLFacetSchema): Token[] {
   if (!parsed || typeof parsed !== "object") return [];
   const rawTokens = (parsed as { tokens?: unknown }).tokens;
   if (!Array.isArray(rawTokens)) return [];
-  const known = new Set(facets.map((f) => f.key));
+  const facetByKey = new Map(facets.map((f) => [f.key, f]));
   const out: Token[] = [];
   for (const item of rawTokens) {
     if (!item || typeof item !== "object") continue;
     const t = item as RawToken;
     if (typeof t.facetKey !== "string" || typeof t.value !== "string") continue;
-    if (!known.has(t.facetKey)) continue;
+    const facet = facetByKey.get(t.facetKey);
+    if (!facet) continue;
     const value = t.value.trim();
     if (!value) continue;
-    const isPattern = t.isPattern === true || value.includes("*");
-    if (isPattern) {
-      out.push({
-        id: nextNLTokenId(),
-        facetKey: t.facetKey,
-        value,
-        isPattern: true,
-      });
-    } else {
-      out.push({ id: nextNLTokenId(), facetKey: t.facetKey, value });
+
+    const negated = t.negated === true;
+
+    // Only accept "op" if the model produced a known operator AND the facet
+    // is numeric. Unknown ops or ops on string/enum facets fall back to
+    // equality / wildcard, matching how the typed parser treats them.
+    let op: Op | undefined;
+    if (typeof t.op === "string" && VALID_OPS.has(t.op) && facet.type === "number") {
+      op = t.op as Op;
     }
+
+    // Range/comparator value must be numerically well-formed; otherwise drop
+    // the op and let the value stand on its own (so we never produce a token
+    // that the filter chokepoint can't satisfy).
+    if (op === "..") {
+      const [lo, hi] = value.split("..").map(Number);
+      if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo > hi) op = undefined;
+    } else if (op) {
+      if (!Number.isFinite(Number(value))) op = undefined;
+    }
+
+    const isPattern = !op && (t.isPattern === true || value.includes("*"));
+
+    const tok: Token = { id: nextNLTokenId(), facetKey: t.facetKey, value };
+    if (isPattern) tok.isPattern = true;
+    if (negated) tok.negated = true;
+    if (op) tok.op = op;
+    out.push(tok);
   }
   return out;
 }
